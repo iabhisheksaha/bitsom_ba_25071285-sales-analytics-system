@@ -1,0 +1,17 @@
+SALES ANALYTICS REPORT
+======================
+
+Total Revenue: 3527808.00
+
+Revenue by Region:
+South: 889332.00
+East: 467969.00
+North: 1321605.00
+West: 848902.00
+
+Top 5 Customers by Revenue:
+C004: 857124.00
+C017: 762460.00
+C010: 457186.00
+C024: 249451.00
+C008: 216176.00
