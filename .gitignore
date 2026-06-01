@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Credentials — NEVER commit these
+config/credentials.enc
+*.key
+.env
+.env.*
+
+# Tailored resumes (generated at runtime)
+resume/tailored/*.docx
+
+# Runtime logs (optional — remove if you want to track application history)
+logs/applications.json
+logs/discovered_jobs.json
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,48 @@
+# Automated Job Application System Configuration
+
+search:
+  roles:
+    - "Product Owner"
+    - "Business Analyst"
+  seniority:
+    - "VP"
+    - "Vice President"
+    - "Senior Vice President"
+    - "Group Vice President"
+  location: "Pune"
+  # Platforms to scrape
+  platforms:
+    linkedin: true
+    indeed: true
+    naukri: true
+
+resume:
+  base_path: "resume/base_resume.docx"
+  output_dir: "resume/tailored"
+
+credentials:
+  encrypted_file: "config/credentials.enc"
+  # Set CRED_KEY environment variable at runtime — never commit the key
+
+telegram:
+  # Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID as environment variables
+  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  chat_id_env: "TELEGRAM_CHAT_ID"
+
+application:
+  log_file: "logs/applications.json"
+  # Seconds to wait between applications to avoid rate limiting
+  delay_between_apps: 30
+  # Seconds to wait for human CAPTCHA resolution before timing out
+  captcha_timeout: 300
+  # Max concurrent sessions (keep at 1 to avoid detection)
+  max_sessions: 1
+
+scraping:
+  # Seconds to wait between page requests
+  request_delay: 3
+  max_pages_per_platform: 5
+  user_agents:
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
