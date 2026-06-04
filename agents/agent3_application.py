@@ -74,10 +74,11 @@ class TelegramNotifier:
                 lines.append(f"  • {app['company']}: {app.get('reason', 'unknown')}")
         self.send("\n".join(lines))
 
-    def poll_captcha_resolved(self, timeout_seconds: int, poll_interval: int = 10) -> bool:
+    def _poll_updates(self, timeout_seconds: int, trigger_fn, poll_interval: int = 10):
+        """Generic Telegram update poller. Calls trigger_fn(text) on each message.
+        Returns whatever trigger_fn returns (non-None = stop polling)."""
         deadline = time.time() + timeout_seconds
         last_update_id = 0
-        print(f"  [Agent3] Waiting up to {timeout_seconds}s for CAPTCHA resolution…")
         while time.time() < deadline:
             try:
                 resp = requests.get(
@@ -88,17 +89,60 @@ class TelegramNotifier:
                 if resp.ok:
                     for update in resp.json().get("result", []):
                         last_update_id = update["update_id"]
-                        msg_text = (
+                        text = (
                             update.get("message", {}).get("text", "") or
                             update.get("channel_post", {}).get("text", "")
-                        )
-                        if "/captcha_done" in msg_text.lower():
-                            print("  [Agent3] CAPTCHA resolved by user.")
-                            return True
+                        ).strip()
+                        result = trigger_fn(text)
+                        if result is not None:
+                            return result
             except requests.RequestException:
                 pass
             time.sleep(poll_interval)
-        return False
+        return None
+
+    def poll_captcha_resolved(self, timeout_seconds: int, poll_interval: int = 10) -> bool:
+        print(f"  [Agent3] Waiting up to {timeout_seconds}s for CAPTCHA resolution…")
+        def check(text):
+            if "/captcha_done" in text.lower():
+                print("  [Agent3] CAPTCHA resolved by user.")
+                return True
+            return None
+        return self._poll_updates(timeout_seconds, check, poll_interval) or False
+
+    def request_credentials(self, ats: str, site_url: str, job: "JobPosting",
+                            timeout_seconds: int) -> "dict | None":
+        """Ask user for ATS credentials via Telegram, return {username, password} or None."""
+        msg = (
+            f"🔐 *Credentials needed — {job.company}*\n\n"
+            f"*Role:* {job.title}\n"
+            f"*ATS:* {ats.title()}\n"
+            f"*URL:* {site_url}\n\n"
+            f"1\\. If you already have an account, reply:\n"
+            f"`/creds your@email.com:yourpassword`\n\n"
+            f"2\\. If you need to register first, visit the URL above, "
+            f"create an account, then reply with `/creds`\\.\n\n"
+            f"Reply `/skip` to skip this job\\.\n"
+            f"_\\(Waiting {timeout_seconds // 60} minutes\\)_"
+        )
+        self.send(msg)
+        print(f"  [Agent3] Waiting up to {timeout_seconds}s for {ats} credentials…")
+
+        def check(text):
+            if text.lower().startswith("/creds "):
+                payload = text[7:].strip()
+                colon = payload.find(":")
+                if colon > 0:
+                    return {"username": payload[:colon], "password": payload[colon + 1:]}
+            if text.lower() in ("/skip", "/skip_job"):
+                print("  [Agent3] User skipped the job.")
+                return "SKIP"
+            return None
+
+        result = self._poll_updates(timeout_seconds, check)
+        if result == "SKIP" or result is None:
+            return None
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -195,11 +239,44 @@ def detect_captcha(page: Page) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# ATS detection
+# ---------------------------------------------------------------------------
+
+_ATS_PATTERNS: dict[str, list[str]] = {
+    "workday":        ["workday.com", "myworkdayjobs.com"],
+    "greenhouse":     ["greenhouse.io", "boards.greenhouse.io"],
+    "lever":          ["jobs.lever.co", "lever.co"],
+    "icims":          ["icims.com"],
+    "taleo":          ["taleo.net"],
+    "smartrecruiters":["smartrecruiters.com"],
+    "successfactors": ["successfactors.com", "successfactors.eu", "sapsf.com"],
+    "bamboohr":       ["bamboohr.com"],
+    "jobvite":        ["jobvite.com"],
+    "ashby":          ["ashbyhq.com"],
+}
+
+
+def detect_ats(url: str) -> "str | None":
+    url_lower = url.lower()
+    for ats, domains in _ATS_PATTERNS.items():
+        if any(d in url_lower for d in domains):
+            return ats
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Platform-specific handlers
 # ---------------------------------------------------------------------------
 
 class SkipApplication(Exception):
     """Raised when a job cannot be applied to automatically (e.g. no Easy Apply)."""
+
+
+class ExternalApplicationRequired(Exception):
+    """Raised when a job requires applying on an external ATS website."""
+    def __init__(self, url: str):
+        super().__init__(url)
+        self.url = url
 
 
 class BaseApplicationHandler:
@@ -336,34 +413,54 @@ class LinkedInHandler(BaseApplicationHandler):
             self.page.wait_for_timeout(3000)
 
             easy_apply = self._find_easy_apply_btn()
-            if not easy_apply:
-                raise SkipApplication("No Easy Apply button — requires external application")
+            if easy_apply:
+                # ── Easy Apply inline flow ──────────────────────────────
+                easy_apply.click()
+                self.page.wait_for_timeout(2000)
+                for _ in range(6):
+                    upload = self.page.query_selector("input[type='file']")
+                    if upload:
+                        upload.set_input_files(str(resume_path.absolute()))
+                        self.page.wait_for_timeout(1000)
+                    submit_btn = self.page.query_selector("button[aria-label*='Submit']")
+                    next_btn   = self.page.query_selector("button[aria-label*='Next']")
+                    review_btn = self.page.query_selector("button[aria-label*='Review']")
+                    if submit_btn:
+                        submit_btn.click()
+                        self.page.wait_for_timeout(2000)
+                        break
+                    elif review_btn:
+                        review_btn.click()
+                        self.page.wait_for_timeout(1000)
+                    elif next_btn:
+                        next_btn.click()
+                        self.page.wait_for_timeout(1000)
+                    else:
+                        break
+                return True
 
-            easy_apply.click()
-            self.page.wait_for_timeout(2000)
+            # ── No Easy Apply — look for external Apply button ─────────
+            ext_btn = self.page.query_selector(
+                "button:has-text('Apply'), a.jobs-apply-button"
+            )
+            if ext_btn:
+                try:
+                    with self.page.context.expect_page(timeout=8000) as popup_info:
+                        ext_btn.click()
+                    popup = popup_info.value
+                    popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                    external_url = popup.url
+                    popup.close()
+                    raise ExternalApplicationRequired(external_url)
+                except PWTimeout:
+                    # Button didn't open a new tab — navigation happened in same page
+                    self.page.wait_for_timeout(3000)
+                    if self.page.url != job.url:
+                        raise ExternalApplicationRequired(self.page.url)
 
-            for _ in range(6):
-                upload = self.page.query_selector("input[type='file']")
-                if upload:
-                    upload.set_input_files(str(resume_path.absolute()))
-                    self.page.wait_for_timeout(1000)
-                submit_btn = self.page.query_selector("button[aria-label*='Submit']")
-                next_btn   = self.page.query_selector("button[aria-label*='Next']")
-                review_btn = self.page.query_selector("button[aria-label*='Review']")
-                if submit_btn:
-                    submit_btn.click()
-                    self.page.wait_for_timeout(2000)
-                    break
-                elif review_btn:
-                    review_btn.click()
-                    self.page.wait_for_timeout(1000)
-                elif next_btn:
-                    next_btn.click()
-                    self.page.wait_for_timeout(1000)
-                else:
-                    break
-            return True
-        except SkipApplication:
+            raise SkipApplication("No apply button found on LinkedIn page")
+
+        except (SkipApplication, ExternalApplicationRequired):
             raise
         except PWTimeout as exc:
             print(f"    [LinkedIn] Apply timeout: {exc}")
@@ -375,6 +472,185 @@ _HANDLER_MAP: dict[str, type] = {
     "indeed": IndeedHandler,
     "linkedin": LinkedInHandler,
 }
+
+
+# ---------------------------------------------------------------------------
+# External ATS handlers
+# ---------------------------------------------------------------------------
+
+class WorkdayHandler(BaseApplicationHandler):
+    """Handles *.myworkdayjobs.com / *.workday.com — requires login."""
+
+    def login(self, username: str, password: str) -> bool:
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(2000)
+            sign_in = self.page.query_selector(
+                "[data-automation-id='signInButton'], a:has-text('Sign In'), button:has-text('Sign In')"
+            )
+            if sign_in:
+                sign_in.click()
+                self.page.wait_for_timeout(2000)
+            email = self.page.query_selector("[data-automation-id='email'], input[type='email']")
+            if email:
+                email.fill(username)
+                nxt = self.page.query_selector("[data-automation-id='nextButton'], button:has-text('Next')")
+                if nxt:
+                    nxt.click()
+                    self.page.wait_for_timeout(1500)
+            pw = self.page.query_selector("[data-automation-id='password'], input[type='password']")
+            if pw:
+                pw.fill(password)
+                ok = self.page.query_selector(
+                    "[data-automation-id='signInSubmitButton'], [data-automation-id='signInButton']"
+                )
+                if ok:
+                    ok.click()
+                    self.page.wait_for_timeout(3000)
+            return True
+        except PWTimeout as exc:
+            print(f"    [Workday] Login timeout: {exc}")
+            return False
+
+    def apply(self, job: JobPosting, resume_path: Path) -> bool:
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(2000)
+            apply_btn = self.page.query_selector(
+                "[data-automation-id='applyButton'], button:has-text('Apply')"
+            )
+            if apply_btn:
+                apply_btn.click()
+                self.page.wait_for_timeout(2000)
+            for _ in range(10):
+                upload = self.page.query_selector("input[type='file']")
+                if upload:
+                    upload.set_input_files(str(resume_path.absolute()))
+                    self.page.wait_for_timeout(1000)
+                done = self.page.query_selector("[data-automation-id='bottom-navigation-done-btn']")
+                nxt  = self.page.query_selector("[data-automation-id='bottom-navigation-next-btn']")
+                if done:
+                    done.click()
+                    self.page.wait_for_timeout(2000)
+                    break
+                elif nxt:
+                    nxt.click()
+                    self.page.wait_for_timeout(1500)
+                else:
+                    break
+            return True
+        except PWTimeout as exc:
+            print(f"    [Workday] Apply timeout: {exc}")
+            return False
+
+
+class GreenhouseHandler(BaseApplicationHandler):
+    """Handles boards.greenhouse.io — no login, just form filling."""
+
+    def login(self, username: str, password: str) -> bool:
+        return True  # Greenhouse has no login wall
+
+    def apply(self, job: JobPosting, resume_path: Path) -> bool:
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(2000)
+            profile = _load_applicant_profile()
+            for sel, val in [
+                ("#first_name, [name='job_application[first_name]']",  profile.get("first_name", "")),
+                ("#last_name,  [name='job_application[last_name]']",   profile.get("last_name", "")),
+                ("#email,      [name='job_application[email]']",        profile.get("email", "")),
+                ("#phone,      [name='job_application[phone]']",        profile.get("phone", "")),
+            ]:
+                el = self.page.query_selector(sel)
+                if el and val:
+                    el.fill(val)
+            upload = self.page.query_selector("#resume, input[type='file']")
+            if upload:
+                upload.set_input_files(str(resume_path.absolute()))
+                self.page.wait_for_timeout(1000)
+            submit = self.page.query_selector(
+                "#submit_app, [data-provides='submit-btn'], button:has-text('Submit Application')"
+            )
+            if submit:
+                submit.click()
+                self.page.wait_for_timeout(2000)
+            return True
+        except PWTimeout as exc:
+            print(f"    [Greenhouse] Apply timeout: {exc}")
+            return False
+
+
+class LeverHandler(BaseApplicationHandler):
+    """Handles jobs.lever.co — no login, just form filling."""
+
+    def login(self, username: str, password: str) -> bool:
+        return True
+
+    def apply(self, job: JobPosting, resume_path: Path) -> bool:
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(2000)
+            apply_btn = self.page.query_selector("a:has-text('Apply'), button:has-text('Apply')")
+            if apply_btn:
+                apply_btn.click()
+                self.page.wait_for_timeout(2000)
+            profile = _load_applicant_profile()
+            for sel, val in [
+                ("[name='name']",    profile.get("name", "")),
+                ("[name='email']",   profile.get("email", "")),
+                ("[name='phone']",   profile.get("phone", "")),
+                ("[name='org']",     ""),  # current company — leave blank
+                ("[name='urls[LinkedIn]']", profile.get("linkedin_url", "")),
+            ]:
+                el = self.page.query_selector(sel)
+                if el and val:
+                    el.fill(val)
+            upload = self.page.query_selector("input[type='file']")
+            if upload:
+                upload.set_input_files(str(resume_path.absolute()))
+                self.page.wait_for_timeout(1000)
+            submit = self.page.query_selector(
+                "button[type='submit'], button:has-text('Submit application')"
+            )
+            if submit:
+                submit.click()
+                self.page.wait_for_timeout(2000)
+            return True
+        except PWTimeout as exc:
+            print(f"    [Lever] Apply timeout: {exc}")
+            return False
+
+
+_NO_LOGIN_ATS = {"greenhouse", "lever", "ashby"}
+
+_ATS_HANDLER_MAP: dict[str, type] = {
+    "workday":    WorkdayHandler,
+    "greenhouse": GreenhouseHandler,
+    "lever":      LeverHandler,
+}
+
+_applicant_profile_cache: "dict | None" = None
+
+def _load_applicant_profile() -> dict:
+    global _applicant_profile_cache
+    if _applicant_profile_cache is not None:
+        return _applicant_profile_cache
+    try:
+        import yaml
+        cfg = yaml.safe_load(open("config/config.yaml"))
+        raw = cfg.get("applicant", {})
+        name_parts = raw.get("name", "").split(" ", 1)
+        _applicant_profile_cache = {
+            "name":         raw.get("name", ""),
+            "first_name":   name_parts[0] if name_parts else "",
+            "last_name":    name_parts[1] if len(name_parts) > 1 else "",
+            "email":        raw.get("email", ""),
+            "phone":        raw.get("phone", ""),
+            "linkedin_url": raw.get("linkedin_url", ""),
+        }
+    except Exception:
+        _applicant_profile_cache = {}
+    return _applicant_profile_cache
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +714,7 @@ class ApplicationAgent:
         self.log = ApplicationLog(self.app_config.get("log_file", "logs/applications.json"))
         self.delay = self.app_config.get("delay_between_apps", 30)
         self.captcha_timeout = self.app_config.get("captcha_timeout", 300)
+        self.creds_request_timeout = self.app_config.get("creds_request_timeout", 600)
 
         tg_cfg = config.get("telegram", {})
         bot_token = os.environ.get(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"), "")
@@ -563,6 +840,9 @@ class ApplicationAgent:
             self.log.record(job, "skipped", str(exc))
             print(f"  [Agent3] SKIPPED — {job.company} ({exc})")
             return
+        except ExternalApplicationRequired as exc:
+            self._handle_external_apply(page, job, resume_path, exc.url)
+            return
 
         if success and detect_captcha(page):
             resolved = self._handle_captcha(job, page.url)
@@ -571,6 +851,54 @@ class ApplicationAgent:
         status = "submitted" if success else "failed"
         self.log.record(job, status, "" if success else "apply error")
         print(f"  [Agent3] {status.upper()} — {job.company}")
+
+    def _handle_external_apply(self, page: Page, job: "JobPosting",
+                                resume_path: Path, external_url: str) -> None:
+        ats = detect_ats(external_url)
+        if not ats or ats not in _ATS_HANDLER_MAP:
+            ats_label = ats or "unknown ATS"
+            print(f"  [Agent3] No handler for {ats_label} — skipping {job.company}.")
+            self.log.record(job, "skipped", f"unsupported ATS: {ats_label}")
+            return
+
+        print(f"  [Agent3] External apply via {ats.title()} → {job.company}")
+
+        # Credentials: not needed for Greenhouse/Lever, required for Workday etc.
+        creds = {"username": "", "password": ""}
+        if ats not in _NO_LOGIN_ATS:
+            cred_key_name = f"{ats}_{job.company.lower().replace(' ', '_')[:24]}"
+            try:
+                creds = self.cred_manager.get_site_credentials(cred_key_name, self.cred_key)
+            except (KeyError, FileNotFoundError):
+                if not self.telegram:
+                    print(f"  [Agent3] No {ats.title()} credentials and Telegram not set — skipping.")
+                    self.log.record(job, "skipped", f"no {ats} credentials")
+                    return
+                creds = self.telegram.request_credentials(
+                    ats, external_url, job, self.creds_request_timeout
+                )
+                if not creds:
+                    self.log.record(job, "skipped", f"user skipped {ats} credentials")
+                    return
+                # Save for future runs
+                self.cred_manager.upsert_credential(cred_key_name, "username", creds["username"], self.cred_key)
+                self.cred_manager.upsert_credential(cred_key_name, "password", creds["password"], self.cred_key)
+                print(f"  [Agent3] {ats.title()} credentials saved for {job.company}")
+
+        page.goto(external_url, timeout=30000)
+        ext_handler: BaseApplicationHandler = _ATS_HANDLER_MAP[ats](page)
+
+        if ats not in _NO_LOGIN_ATS:
+            logged_in = ext_handler.login(creds["username"], creds["password"])
+            if not logged_in:
+                print(f"  [Agent3] {ats.title()} login failed for {job.company}.")
+                self.log.record(job, "failed", f"{ats} login failed")
+                return
+
+        success = ext_handler.apply(job, resume_path)
+        status = "submitted" if success else "failed"
+        self.log.record(job, status, "" if success else f"{ats} apply error")
+        print(f"  [Agent3] {status.upper()} ({ats.title()}) — {job.company}")
 
     def _handle_captcha(self, job, current_url):
         print(f"  [Agent3] CAPTCHA detected for {job.company}")

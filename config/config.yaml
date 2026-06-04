@@ -38,12 +38,22 @@ email:
   # EMAIL_SMTP_HOST    — defaults to smtp.gmail.com
   # EMAIL_SMTP_PORT    — defaults to 587
 
+applicant:
+  # Your personal details used to fill external ATS application forms
+  name: "Abhishek Saha"
+  email: "abhisheksaha@live.com"
+  phone: ""          # e.g. "+91 98765 43210"
+  linkedin_url: ""   # e.g. "https://www.linkedin.com/in/abhisheksaha"
+  location: "Pune, Maharashtra, India"
+
 application:
   log_file: "logs/applications.json"
   # Seconds to wait between applications to avoid rate limiting
   delay_between_apps: 30
-  # Seconds to wait for human CAPTCHA resolution before timing out
+  # Seconds to wait for human CAPTCHA / credential response before timing out
   captcha_timeout: 300
+  # Seconds to wait for user to provide ATS credentials via Telegram
+  creds_request_timeout: 600
   # Max concurrent sessions (keep at 1 to avoid detection)
   max_sessions: 1
 
