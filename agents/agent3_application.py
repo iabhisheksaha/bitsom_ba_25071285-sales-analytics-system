@@ -2,6 +2,7 @@
 Agent 3: Application Execution and Notification
 Navigates to job pages, logs in, fills forms, uploads the tailored resume,
 handles CAPTCHAs via Telegram, and sends a daily summary.
+Uses Playwright for browser automation.
 """
 
 import json
@@ -12,19 +13,15 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from selenium import webdriver
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    TimeoutException,
-    WebDriverException,
-)
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PWTimeout
 
 from agents.agent1_job_discovery import JobPosting
 from agents.agent4_credentials import CredentialManager
+
+CHROMIUM_BIN = os.environ.get(
+    "CHROMIUM_BIN",
+    "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +71,6 @@ class TelegramNotifier:
         self.send("\n".join(lines))
 
     def poll_captcha_resolved(self, timeout_seconds: int, poll_interval: int = 10) -> bool:
-        """
-        Poll the Telegram getUpdates endpoint to detect when the user replies
-        `/captcha_done`, confirming the CAPTCHA has been solved.
-        Returns True if confirmed within timeout, False otherwise.
-        """
         deadline = time.time() + timeout_seconds
         last_update_id = 0
         print(f"  [Agent3] Waiting up to {timeout_seconds}s for CAPTCHA resolution…")
@@ -120,25 +112,23 @@ _CAPTCHA_SELECTORS = [
 ]
 
 
-def detect_captcha(driver: webdriver.Chrome) -> bool:
+def detect_captcha(page: Page) -> bool:
     for selector in _CAPTCHA_SELECTORS:
         try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-            if elements:
+            if page.query_selector(selector):
                 return True
-        except WebDriverException:
+        except Exception:
             pass
     return False
 
 
 # ---------------------------------------------------------------------------
-# Platform-specific application handlers
+# Platform-specific handlers
 # ---------------------------------------------------------------------------
 
 class BaseApplicationHandler:
-    def __init__(self, driver: webdriver.Chrome, wait: WebDriverWait):
-        self.driver = driver
-        self.wait = wait
+    def __init__(self, page: Page):
+        self.page = page
 
     def login(self, username: str, password: str) -> bool:
         raise NotImplementedError
@@ -148,134 +138,129 @@ class BaseApplicationHandler:
 
 
 class NaukriHandler(BaseApplicationHandler):
-
     LOGIN_URL = "https://www.naukri.com/nlogin/login"
 
     def login(self, username: str, password: str) -> bool:
         try:
-            self.driver.get(self.LOGIN_URL)
-            self.wait.until(EC.presence_of_element_located((By.ID, "usernameField")))
-            self.driver.find_element(By.ID, "usernameField").send_keys(username)
-            self.driver.find_element(By.ID, "passwordField").send_keys(password)
-            self.driver.find_element(By.XPATH, "//button[@type='submit']").click()
-            time.sleep(3)
-            return "naukri.com" in self.driver.current_url
-        except (NoSuchElementException, TimeoutException) as exc:
-            print(f"    [Naukri] Login failed: {exc}")
+            self.page.goto(self.LOGIN_URL, timeout=30000)
+            self.page.wait_for_selector("#usernameField", timeout=15000)
+            self.page.fill("#usernameField", username)
+            self.page.fill("#passwordField", password)
+            self.page.click("button[type='submit']")
+            self.page.wait_for_timeout(3000)
+            logged_in = "naukri.com" in self.page.url and "login" not in self.page.url
+            print(f"    [Naukri] Login {'succeeded' if logged_in else 'failed'} — URL: {self.page.url[:60]}")
+            return logged_in
+        except PWTimeout as exc:
+            print(f"    [Naukri] Login timeout: {exc}")
             return False
 
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
         try:
-            self.driver.get(job.url)
-            self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='apply']")))
-            apply_btn = self.driver.find_element(By.CSS_SELECTOR, "button[class*='apply'], a[class*='apply']")
-            apply_btn.click()
-            time.sleep(2)
-            # Upload resume if prompted
-            try:
-                upload = self.driver.find_element(By.CSS_SELECTOR, "input[type='file']")
-                upload.send_keys(str(resume_path.absolute()))
-                time.sleep(1)
-            except NoSuchElementException:
-                pass
-            # Submit
-            submit = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit'], button[class*='submit']")
-            submit.click()
-            time.sleep(2)
+            self.page.goto(job.url, timeout=30000)
+            self.page.wait_for_selector("[class*='apply']", timeout=15000)
+            apply_btn = self.page.query_selector("button[class*='apply'], a[class*='apply']")
+            if apply_btn:
+                apply_btn.click()
+                self.page.wait_for_timeout(2000)
+            upload = self.page.query_selector("input[type='file']")
+            if upload:
+                upload.set_input_files(str(resume_path.absolute()))
+                self.page.wait_for_timeout(1000)
+            submit = self.page.query_selector("button[type='submit'], button[class*='submit']")
+            if submit:
+                submit.click()
+                self.page.wait_for_timeout(2000)
             return True
-        except (NoSuchElementException, TimeoutException) as exc:
-            print(f"    [Naukri] Apply failed: {exc}")
+        except PWTimeout as exc:
+            print(f"    [Naukri] Apply timeout: {exc}")
             return False
 
 
 class IndeedHandler(BaseApplicationHandler):
-
     LOGIN_URL = "https://secure.indeed.com/auth"
 
     def login(self, username: str, password: str) -> bool:
         try:
-            self.driver.get(self.LOGIN_URL)
-            self.wait.until(EC.presence_of_element_located((By.ID, "login-email-input")))
-            self.driver.find_element(By.ID, "login-email-input").send_keys(username)
-            self.driver.find_element(By.XPATH, "//button[@type='submit']").click()
-            self.wait.until(EC.presence_of_element_located((By.ID, "login-password-input")))
-            self.driver.find_element(By.ID, "login-password-input").send_keys(password)
-            self.driver.find_element(By.XPATH, "//button[@type='submit']").click()
-            time.sleep(3)
+            self.page.goto(self.LOGIN_URL, timeout=30000)
+            self.page.wait_for_selector("#login-email-input", timeout=15000)
+            self.page.fill("#login-email-input", username)
+            self.page.click("button[type='submit']")
+            self.page.wait_for_selector("#login-password-input", timeout=10000)
+            self.page.fill("#login-password-input", password)
+            self.page.click("button[type='submit']")
+            self.page.wait_for_timeout(3000)
             return True
-        except (NoSuchElementException, TimeoutException) as exc:
-            print(f"    [Indeed] Login failed: {exc}")
+        except PWTimeout as exc:
+            print(f"    [Indeed] Login timeout: {exc}")
             return False
 
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
         try:
-            self.driver.get(job.url)
-            apply_btn = self.wait.until(EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, "button[class*='ia-continueButton'], #indeedApplyButton")
-            ))
+            self.page.goto(job.url, timeout=30000)
+            apply_btn = self.page.wait_for_selector(
+                "button[class*='ia-continueButton'], #indeedApplyButton", timeout=15000
+            )
             apply_btn.click()
-            time.sleep(2)
-            try:
-                upload = self.driver.find_element(By.CSS_SELECTOR, "input[type='file']")
-                upload.send_keys(str(resume_path.absolute()))
-                time.sleep(1)
-            except NoSuchElementException:
-                pass
-            submit = self.driver.find_element(By.XPATH, "//button[contains(text(), 'Submit')]")
-            submit.click()
-            time.sleep(2)
+            self.page.wait_for_timeout(2000)
+            upload = self.page.query_selector("input[type='file']")
+            if upload:
+                upload.set_input_files(str(resume_path.absolute()))
+                self.page.wait_for_timeout(1000)
+            submit = self.page.query_selector("button:has-text('Submit')")
+            if submit:
+                submit.click()
+                self.page.wait_for_timeout(2000)
             return True
-        except (NoSuchElementException, TimeoutException) as exc:
-            print(f"    [Indeed] Apply failed: {exc}")
+        except PWTimeout as exc:
+            print(f"    [Indeed] Apply timeout: {exc}")
             return False
 
 
 class LinkedInHandler(BaseApplicationHandler):
-
     LOGIN_URL = "https://www.linkedin.com/login"
 
     def login(self, username: str, password: str) -> bool:
         try:
-            self.driver.get(self.LOGIN_URL)
-            self.wait.until(EC.presence_of_element_located((By.ID, "username")))
-            self.driver.find_element(By.ID, "username").send_keys(username)
-            self.driver.find_element(By.ID, "password").send_keys(password)
-            self.driver.find_element(By.XPATH, "//button[@type='submit']").click()
-            time.sleep(3)
-            return "linkedin.com/feed" in self.driver.current_url
-        except (NoSuchElementException, TimeoutException) as exc:
-            print(f"    [LinkedIn] Login failed: {exc}")
+            self.page.goto(self.LOGIN_URL, timeout=30000)
+            self.page.wait_for_selector("#username", timeout=15000)
+            self.page.fill("#username", username)
+            self.page.fill("#password", password)
+            self.page.click("button[type='submit']")
+            self.page.wait_for_timeout(4000)
+            logged_in = "linkedin.com/feed" in self.page.url or "linkedin.com/in/" in self.page.url
+            print(f"    [LinkedIn] Login {'succeeded' if logged_in else 'may need verification'} — URL: {self.page.url[:60]}")
+            return logged_in
+        except PWTimeout as exc:
+            print(f"    [LinkedIn] Login timeout: {exc}")
             return False
 
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
         try:
-            self.driver.get(job.url)
-            easy_apply = self.wait.until(EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, "button[class*='jobs-apply-button']")
-            ))
+            self.page.goto(job.url, timeout=30000)
+            easy_apply = self.page.wait_for_selector(
+                "button[class*='jobs-apply-button']", timeout=15000
+            )
             easy_apply.click()
-            time.sleep(2)
-            # Handle multi-step Easy Apply modal
+            self.page.wait_for_timeout(2000)
             for _ in range(5):
-                try:
-                    upload = self.driver.find_element(By.CSS_SELECTOR, "input[type='file']")
-                    upload.send_keys(str(resume_path.absolute()))
-                    time.sleep(1)
-                except NoSuchElementException:
-                    pass
-                try:
-                    next_btn = self.driver.find_element(
-                        By.XPATH, "//button[contains(@aria-label, 'Submit') or contains(@aria-label, 'Next')]"
-                    )
+                upload = self.page.query_selector("input[type='file']")
+                if upload:
+                    upload.set_input_files(str(resume_path.absolute()))
+                    self.page.wait_for_timeout(1000)
+                submit_btn = self.page.query_selector("button[aria-label*='Submit']")
+                next_btn = self.page.query_selector("button[aria-label*='Next']")
+                if submit_btn:
+                    submit_btn.click()
+                    break
+                elif next_btn:
                     next_btn.click()
-                    time.sleep(1)
-                    if "aria-label" in next_btn.get_attribute("outerHTML") and "Submit" in next_btn.get_attribute("aria-label"):
-                        break
-                except NoSuchElementException:
+                    self.page.wait_for_timeout(1000)
+                else:
                     break
             return True
-        except (NoSuchElementException, TimeoutException) as exc:
-            print(f"    [LinkedIn] Apply failed: {exc}")
+        except PWTimeout as exc:
+            print(f"    [LinkedIn] Apply timeout: {exc}")
             return False
 
 
@@ -357,53 +342,36 @@ class ApplicationAgent:
         if not self.telegram:
             print("[Agent3] Telegram not configured — CAPTCHA alerts and summaries disabled.")
 
-    # ------------------------------------------------------------------
-    # Browser lifecycle
-    # ------------------------------------------------------------------
-
-    def _build_driver(self) -> webdriver.Chrome:
-        opts = Options()
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1280,800")
-        # Reduce fingerprinting
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        return webdriver.Chrome(options=opts)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def _launch_browser(self, playwright):
+        chromium_bin = CHROMIUM_BIN if Path(CHROMIUM_BIN).exists() else None
+        launch_kwargs = dict(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                  "--ignore-certificate-errors"],
+        )
+        if chromium_bin:
+            launch_kwargs["executable_path"] = chromium_bin
+        return playwright.chromium.launch(**launch_kwargs)
 
     def run(self, jobs: list[JobPosting], tailored_resumes: dict[str, Path]) -> None:
-        """
-        Process the job list. tailored_resumes maps f"{platform}::{company}::{title}" → Path.
-        """
         print(f"[Agent3] Starting application run for {len(jobs)} jobs")
 
-        # Group by platform so we only log in once per site
         by_platform: dict[str, list[JobPosting]] = {}
         for job in jobs:
             by_platform.setdefault(job.platform, []).append(job)
 
-        for platform, platform_jobs in by_platform.items():
-            self._process_platform(platform, platform_jobs, tailored_resumes)
+        with sync_playwright() as playwright:
+            for platform, platform_jobs in by_platform.items():
+                self._process_platform(playwright, platform, platform_jobs, tailored_resumes)
 
-        # Daily summary
         submitted, failed = self.log.todays_summary()
         print(f"\n[Agent3] Daily totals — submitted: {len(submitted)}, failed: {len(failed)}")
         if self.telegram:
             self.telegram.send_daily_summary(submitted, failed)
 
-    def _process_platform(
-        self,
-        platform: str,
-        jobs: list[JobPosting],
-        tailored_resumes: dict[str, Path],
-    ) -> None:
+    def _process_platform(self, playwright, platform, jobs, tailored_resumes):
         if platform not in _HANDLER_MAP:
-            print(f"  [Agent3] No handler for platform '{platform}' — skipping.")
+            print(f"  [Agent3] No handler for '{platform}' — skipping.")
             return
 
         try:
@@ -412,33 +380,28 @@ class ApplicationAgent:
             print(f"  [Agent3] No credentials for '{platform}' — skipping.")
             return
 
-        driver = self._build_driver()
-        wait = WebDriverWait(driver, timeout=20)
-        handler: BaseApplicationHandler = _HANDLER_MAP[platform](driver, wait)
+        browser: Browser = self._launch_browser(playwright)
+        ctx = browser.new_context(ignore_https_errors=True)
+        page = ctx.new_page()
+        handler: BaseApplicationHandler = _HANDLER_MAP[platform](page)
 
         try:
             logged_in = handler.login(creds.get("username", ""), creds.get("password", ""))
             if not logged_in:
-                print(f"  [Agent3] Login failed for {platform}")
+                print(f"  [Agent3] Login failed for {platform} — skipping platform.")
                 return
 
             for job in jobs:
-                self._apply_to_job(handler, driver, job, tailored_resumes)
+                self._apply_to_job(handler, page, job, tailored_resumes)
                 time.sleep(self.delay)
         finally:
-            driver.quit()
+            browser.close()
 
-    def _apply_to_job(
-        self,
-        handler: BaseApplicationHandler,
-        driver: webdriver.Chrome,
-        job: JobPosting,
-        tailored_resumes: dict[str, Path],
-    ) -> None:
+    def _apply_to_job(self, handler, page, job, tailored_resumes):
         key = f"{job.platform}::{job.company}::{job.title}"
 
         if self.log.already_applied(job):
-            print(f"  [Agent3] Already applied to {job.company} ({job.title}) — skipping.")
+            print(f"  [Agent3] Already applied to {job.company} — skipping.")
             return
 
         resume_path = tailored_resumes.get(key)
@@ -449,32 +412,26 @@ class ApplicationAgent:
 
         print(f"  [Agent3] Applying → {job.company} | {job.title} ({job.platform})")
 
-        # Check for CAPTCHA before attempting
-        if detect_captcha(driver):
-            resolved = self._handle_captcha(job, driver.current_url)
+        if detect_captcha(page):
+            resolved = self._handle_captcha(job, page.url)
             if not resolved:
                 self.log.record(job, "failed", "CAPTCHA timeout")
                 return
 
         success = handler.apply(job, resume_path)
 
-        # Post-apply CAPTCHA check
-        if success and detect_captcha(driver):
-            resolved = self._handle_captcha(job, driver.current_url)
+        if success and detect_captcha(page):
+            resolved = self._handle_captcha(job, page.url)
             success = resolved
 
         status = "submitted" if success else "failed"
         self.log.record(job, status, "" if success else "apply error")
         print(f"  [Agent3] {status.upper()} — {job.company}")
 
-    def _handle_captcha(self, job: JobPosting, current_url: str) -> bool:
+    def _handle_captcha(self, job, current_url):
         print(f"  [Agent3] CAPTCHA detected for {job.company}")
         if self.telegram:
             self.telegram.send_captcha_alert(job, current_url, self.captcha_timeout)
             return self.telegram.poll_captcha_resolved(self.captcha_timeout)
-        else:
-            print(
-                f"  [Agent3] CAPTCHA on {current_url} — Telegram not configured. "
-                "Cannot request manual intervention. Skipping."
-            )
-            return False
+        print(f"  [Agent3] Telegram not configured — skipping CAPTCHA job.")
+        return False
