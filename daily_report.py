@@ -99,7 +99,7 @@ def format_report(target: date, log: dict) -> str:
 def save_report(report_text: str, target: date) -> Path:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     path = REPORTS_DIR / f"report_{target.isoformat()}.txt"
-    path.write_text(report_text)
+    path.write_text(report_text, encoding="utf-8")
     return path
 
 
