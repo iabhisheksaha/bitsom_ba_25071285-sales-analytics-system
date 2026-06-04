@@ -111,13 +111,53 @@ class BaseScraper:
 # ---------------------------------------------------------------------------
 
 class NaukriScraper:
-    BASE_URL = "https://www.naukri.com"
+    BASE_URL   = "https://www.naukri.com"
+    LOGIN_URL  = "https://www.naukri.com/login"
 
     def __init__(self, config: dict, browser):
         self.config = config
         self.browser = browser
         self.max_pages = config.get("scraping", {}).get("max_pages_per_platform", 5)
         self.delay = config.get("scraping", {}).get("request_delay", 3)
+
+    def _try_login(self, page) -> bool:
+        """
+        Attempt Naukri login using credentials from the encrypted store.
+        Returns True on success, False if credentials unavailable or login failed.
+        """
+        try:
+            from agents.agent4_credentials import CredentialManager, load_key_from_env
+            key  = load_key_from_env("CRED_KEY")
+            mgr  = CredentialManager(self.config.get("credentials", {}).get("encrypted_file", "config/credentials.enc"))
+            cred = mgr.get_site_credentials("naukri", key)
+            username = cred.get("username", "")
+            password = cred.get("password", "")
+            if not username or not password:
+                return False
+        except Exception as exc:
+            print(f"  [Agent1/Naukri] Credentials unavailable, scraping as guest: {exc}")
+            return False
+
+        try:
+            print("  [Agent1/Naukri] Logging in…")
+            page.goto(self.LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            # Email field
+            page.fill("input[placeholder*='Email'], input[type='email'], #usernameField", username, timeout=8000)
+            page.wait_for_timeout(500)
+            # Password field
+            page.fill("input[type='password'], #passwordField", password, timeout=8000)
+            page.wait_for_timeout(500)
+            # Submit
+            page.click("button[type='submit'], input[type='submit']", timeout=8000)
+            # Wait for redirect away from login page
+            page.wait_for_url(lambda url: "login" not in url, timeout=15000)
+            print("  [Agent1/Naukri] Login successful")
+            page.wait_for_timeout(2000)
+            return True
+        except Exception as exc:
+            print(f"  [Agent1/Naukri] Login attempt failed (continuing as guest): {exc}")
+            return False
 
     def scrape(self, roles: list, seniority_keywords: list, location: str) -> list[JobPosting]:
         postings: list[JobPosting] = []
@@ -135,6 +175,7 @@ class NaukriScraper:
         )
         page = ctx.new_page()
         try:
+            self._try_login(page)
             for role in roles:
                 keyword = f"{role} {seniority_keywords[0]}"
                 for p in range(1, self.max_pages + 1):
@@ -181,18 +222,41 @@ class NaukriScraper:
             """)
             if data:
                 props = data.get("props", {}).get("pageProps", {})
+                # Naukri has changed the key path several times; try all known variants
                 job_list = (
                     props.get("jobDetails") or
                     props.get("jobResults", {}).get("jobDetails") or
-                    props.get("data", {}).get("jobDetails") or []
+                    props.get("data", {}).get("jobDetails") or
+                    props.get("initialState", {}).get("jobDetails") or
+                    []
                 )
+                # Also check top-level props for alternate structures
+                if not job_list:
+                    def _deep_find(obj, depth=0):
+                        if depth > 6 or not isinstance(obj, dict):
+                            return []
+                        if "jobDetails" in obj and isinstance(obj["jobDetails"], list):
+                            return obj["jobDetails"]
+                        for v in obj.values():
+                            found = _deep_find(v, depth + 1)
+                            if found:
+                                return found
+                        return []
+                    job_list = _deep_find(data)
+
                 if job_list:
+                    print(f"  [Agent1/Naukri] __NEXT_DATA__ found {len(job_list)} job objects")
                     return [self._parse_job_obj(j) for j in job_list if j.get("title")]
-        except Exception:
-            pass
+                else:
+                    print("  [Agent1/Naukri] __NEXT_DATA__ present but no jobDetails array found")
+        except Exception as exc:
+            print(f"  [Agent1/Naukri] __NEXT_DATA__ parse error: {exc}")
 
         # ── Fall back to HTML DOM ──────────────────────────────────────────
-        return self._parse_html(page.content(), role)
+        results = self._parse_html(page.content(), role)
+        if not results:
+            print("  [Agent1/Naukri] HTML DOM fallback also found 0 cards")
+        return results
 
     def _parse_job_obj(self, j: dict) -> JobPosting:
         jd_url = j.get("jdURL") or j.get("jobUrl") or ""
