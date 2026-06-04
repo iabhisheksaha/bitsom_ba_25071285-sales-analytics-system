@@ -6,6 +6,7 @@ Access is granted only when the correct key is supplied at runtime.
 
 import json
 import os
+import stat
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -51,6 +52,8 @@ class CredentialManager:
         payload = json.dumps(credentials).encode()
         encrypted = self._fernet(key).encrypt(payload)
         self.credentials_path.write_bytes(encrypted)
+        # Restrict file to owner read/write only (chmod 600)
+        self.credentials_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
         print(f"[Agent4] Credential store initialised at {self.credentials_path}")
 
     # ------------------------------------------------------------------
@@ -107,6 +110,7 @@ class CredentialManager:
         payload = json.dumps(store).encode()
         encrypted = self._fernet(key).encrypt(payload)
         self.credentials_path.write_bytes(encrypted)
+        self.credentials_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
         print(f"[Agent4] Updated {site}.{field}")
 
 

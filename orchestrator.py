@@ -64,13 +64,15 @@ def setup_creds_from_env(config: dict) -> None:
     platforms = [p for p, enabled in config.get("search", {}).get("platforms", {}).items() if enabled]
     credentials: dict = {}
     for platform in platforms:
-        user = os.environ.get(f"{platform.upper()}_USER", "")
-        pw   = os.environ.get(f"{platform.upper()}_PASS", "")
+        user_key = f"{platform.upper()}_USER"
+        pass_key = f"{platform.upper()}_PASS"
+        user = os.environ.get(user_key, "")
+        pw   = os.environ.get(pass_key, "")
         if user and pw:
             credentials[platform] = {"username": user, "password": pw}
             print(f"[Orchestrator] Credentials loaded for {platform}")
         else:
-            print(f"[Orchestrator] {platform.upper()}_USER / _PASS not set — skipping {platform}")
+            print(f"[Orchestrator] {user_key} / {pass_key} not set — skipping {platform}")
 
     if not credentials:
         print("[Orchestrator] No credentials found in environment. Nothing saved.")
@@ -79,7 +81,13 @@ def setup_creds_from_env(config: dict) -> None:
     cred_path = config.get("credentials", {}).get("encrypted_file", "config/credentials.enc")
     manager = CredentialManager(cred_path)
     manager.init_store(cred_key_str.encode(), credentials)
-    print(f"[Orchestrator] credentials.enc written to {cred_path}")
+
+    # Wipe plaintext credentials from the process environment immediately —
+    # only the encrypted file + CRED_KEY are needed from this point on.
+    for platform in platforms:
+        os.environ.pop(f"{platform.upper()}_USER", None)
+        os.environ.pop(f"{platform.upper()}_PASS", None)
+    print(f"[Orchestrator] credentials.enc written and plaintext env vars cleared.")
 
 
 def init_credentials(config: dict) -> None:
