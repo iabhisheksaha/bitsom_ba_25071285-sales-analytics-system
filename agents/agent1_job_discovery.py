@@ -2,6 +2,10 @@
 Agent 1: Job Discovery and Scraping
 Searches LinkedIn, Indeed, and Naukri.com for VP-level Product Owner /
 Business Analyst roles in Pune and returns structured job postings.
+
+LinkedIn  — requests-based (guest JSON API, no login needed)
+Naukri    — Playwright-based (JS-rendered page, session cookies required)
+Indeed    — Playwright-based (JS-rendered page, anti-bot on requests)
 """
 
 import os
@@ -9,11 +13,10 @@ import random
 import re
 import time
 import urllib3
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from html import unescape
+from pathlib import Path
 from typing import Optional
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -37,7 +40,30 @@ class JobPosting:
 
 
 # ---------------------------------------------------------------------------
-# Base scraper
+# Shared browser launcher (reuses Agent 3 config so proxy is consistent)
+# ---------------------------------------------------------------------------
+
+def _launch_scraper_browser(pw):
+    from agents.agent3_application import CHROMIUM_BIN, SCRAPER_API_KEY as SA_KEY
+    chromium_bin = CHROMIUM_BIN if Path(CHROMIUM_BIN).exists() else None
+    launch_kwargs = dict(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+              "--ignore-certificate-errors"],
+    )
+    if chromium_bin:
+        launch_kwargs["executable_path"] = chromium_bin
+    if SA_KEY:
+        launch_kwargs["proxy"] = {
+            "server":   "http://proxy-server.scraperapi.com:8001",
+            "username": "scraperapi",
+            "password": SA_KEY,
+        }
+    return pw.chromium.launch(**launch_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Requests-based base scraper (LinkedIn only)
 # ---------------------------------------------------------------------------
 
 class BaseScraper:
@@ -77,156 +103,226 @@ class BaseScraper:
 
 
 # ---------------------------------------------------------------------------
-# Naukri scraper  (uses Naukri's JSON search API — no JS rendering needed)
+# Naukri scraper  — Playwright (handles JS rendering + session cookies)
 # ---------------------------------------------------------------------------
 
-class NaukriScraper(BaseScraper):
-    # Naukri's internal JSON API — returns structured job data directly
-    SEARCH_API  = "https://www.naukri.com/jobapi/v3/search"
-    BASE_URL    = "https://www.naukri.com"
+class NaukriScraper:
+    BASE_URL = "https://www.naukri.com"
 
-    def _api_headers(self) -> dict:
-        return {
-            **self._headers(),
-            "appid":    "109",
-            "systemid": "109",
-            "Accept":   "application/json",
-        }
+    def __init__(self, config: dict, browser):
+        self.config = config
+        self.browser = browser
+        self.max_pages = config.get("scraping", {}).get("max_pages_per_platform", 5)
+        self.delay = config.get("scraping", {}).get("request_delay", 3)
 
     def scrape(self, roles: list, seniority_keywords: list, location: str) -> list[JobPosting]:
         postings: list[JobPosting] = []
-        for role in roles:
-            keyword = f"{role} {seniority_keywords[0]}"
-            for page in range(1, self.max_pages + 1):
-                params = {
-                    "noOfResults": 20,
-                    "urlType":     "search_by_key_loc",
-                    "searchType":  "adv",
-                    "keyword":     keyword,
-                    "location":    location.lower(),
-                    "pageNo":      page,
-                }
-                print(f"  [Agent1/Naukri] API page {page} for '{keyword}'")
-                jobs = self._fetch_page(params)
-                if not jobs:
-                    break
-                postings.extend(jobs)
-                time.sleep(self.request_delay)
+        ctx = self.browser.new_context(
+            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="en-IN",
+        )
+        page = ctx.new_page()
+        try:
+            for role in roles:
+                keyword = f"{role} {seniority_keywords[0]}"
+                for p in range(1, self.max_pages + 1):
+                    slug = re.sub(r"\s+", "-", keyword.lower())
+                    loc  = location.lower()
+                    url  = f"{self.BASE_URL}/{slug}-jobs-in-{loc}-{p}"
+                    print(f"  [Agent1/Naukri] Page {p}: {url}")
+                    try:
+                        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                        page.wait_for_timeout(4000)
+                        jobs = self._extract(page, role)
+                        print(f"  [Agent1/Naukri]   → {len(jobs)} jobs")
+                        if not jobs:
+                            break
+                        postings.extend(jobs)
+                        time.sleep(self.delay)
+                    except Exception as exc:
+                        print(f"  [Agent1/Naukri] Error on page {p}: {exc}")
+                        break
+        finally:
+            ctx.close()
         return postings
 
-    def _fetch_page(self, params: dict) -> list[JobPosting]:
+    def _extract(self, page, role: str) -> list[JobPosting]:
+        # ── Try Next.js data store first (fastest, most complete) ──────────
         try:
-            resp = self.session.get(
-                self.SEARCH_API,
-                headers=self._api_headers(),
-                params=params,
-                timeout=20,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            print(f"  [Agent1/Naukri] API error: {exc}")
-            return []
+            data = page.evaluate("""
+                () => {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    if (!el) return null;
+                    try { return JSON.parse(el.textContent); } catch { return null; }
+                }
+            """)
+            if data:
+                props = data.get("props", {}).get("pageProps", {})
+                job_list = (
+                    props.get("jobDetails") or
+                    props.get("jobResults", {}).get("jobDetails") or
+                    props.get("data", {}).get("jobDetails") or []
+                )
+                if job_list:
+                    return [self._parse_job_obj(j) for j in job_list if j.get("title")]
+        except Exception:
+            pass
 
+        # ── Fall back to HTML DOM ──────────────────────────────────────────
+        return self._parse_html(page.content(), role)
+
+    def _parse_job_obj(self, j: dict) -> JobPosting:
+        jd_url = j.get("jdURL") or j.get("jobUrl") or ""
+        if jd_url and not jd_url.startswith("http"):
+            jd_url = self.BASE_URL + jd_url
+
+        placeholders = j.get("placeholders") or j.get("locations") or []
+        loc = "Pune"
+        for ph in placeholders:
+            if isinstance(ph, dict) and ph.get("type") == "location":
+                loc = ph.get("label", "Pune")
+                break
+            elif isinstance(ph, str):
+                loc = ph
+                break
+
+        return JobPosting(
+            platform="naukri",
+            title=j.get("title", "").strip(),
+            company=j.get("companyName", "Unknown").strip(),
+            location=loc,
+            url=jd_url,
+            jd_text=BeautifulSoup(j.get("jobDescription", ""), "html.parser").get_text("\n"),
+            job_id=str(j.get("jobId", "")),
+        )
+
+    def _parse_html(self, html: str, role: str) -> list[JobPosting]:
+        soup = BeautifulSoup(html, "html.parser")
+        cards = (
+            soup.select("article.srp-jobtuple-wrapper") or
+            soup.select("[class*='srp-jobtuple']") or
+            soup.select("article.jobTuple") or
+            soup.select("[data-job-id]")
+        )
         results = []
-        for j in data.get("jobDetails", []):
-            title = j.get("title", "").strip()
-            if not title:
+        for card in cards:
+            title_el = (
+                card.select_one("a.title") or
+                card.select_one("[class*='title'] a") or
+                card.select_one("h2 a")
+            )
+            if not title_el:
                 continue
-            jd_url = j.get("jdURL", "")
-            if jd_url and not jd_url.startswith("http"):
-                jd_url = self.BASE_URL + jd_url
-            jd_text = BeautifulSoup(j.get("jobDescription", ""), "html.parser").get_text("\n")
-            locations = j.get("placeholders", [])
-            loc_str = ", ".join(
-                p.get("label", "") for p in locations if p.get("type") == "location"
-            ) or "Pune"
+            company_el = card.select_one("a.comp-name") or card.select_one("[class*='comp-name']")
+            loc_el     = card.select_one("span.locWdth") or card.select_one("[class*='location']")
+            href = title_el.get("href", "")
+            if href and not href.startswith("http"):
+                href = self.BASE_URL + href
             results.append(JobPosting(
                 platform="naukri",
-                title=title,
-                company=j.get("companyName", "Unknown").strip(),
-                location=loc_str,
-                url=jd_url,
-                jd_text=jd_text,
-                job_id=str(j.get("jobId", "")),
+                title=title_el.get_text(strip=True),
+                company=company_el.get_text(strip=True) if company_el else "Unknown",
+                location=loc_el.get_text(strip=True) if loc_el else "Pune",
+                url=href,
+                job_id=card.get("data-job-id", ""),
             ))
         return results
 
 
 # ---------------------------------------------------------------------------
-# Indeed scraper  (uses Indeed RSS feed — not blocked like the HTML endpoint)
+# Indeed scraper  — Playwright (403 on requests even with residential IP)
 # ---------------------------------------------------------------------------
 
-class IndeedScraper(BaseScraper):
-    RSS_URL  = "https://in.indeed.com/rss"
-    BASE_URL = "https://in.indeed.com"
+class IndeedScraper:
+    SEARCH_URL = "https://in.indeed.com/jobs"
+
+    def __init__(self, config: dict, browser):
+        self.config = config
+        self.browser = browser
+        self.max_pages = config.get("scraping", {}).get("max_pages_per_platform", 5)
+        self.delay = config.get("scraping", {}).get("request_delay", 3)
 
     def scrape(self, roles: list, seniority_keywords: list, location: str) -> list[JobPosting]:
         postings: list[JobPosting] = []
-        for role in roles:
-            query = f"{role} {seniority_keywords[0]}"
-            print(f"  [Agent1/Indeed] RSS feed for '{query}' in {location}")
-            params = {"q": query, "l": location, "fromage": 30, "sort": "date"}
-            jobs = self._fetch_rss(params)
-            print(f"  [Agent1/Indeed]   → {len(jobs)} items")
-            postings.extend(jobs)
-            time.sleep(self.request_delay)
+        ctx = self.browser.new_context(
+            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
+        page = ctx.new_page()
+        try:
+            for role in roles:
+                query = f"{role} {seniority_keywords[0]}"
+                for p in range(self.max_pages):
+                    url = (
+                        f"{self.SEARCH_URL}"
+                        f"?q={quote_plus(query)}&l={quote_plus(location)}"
+                        f"&fromage=30&start={p * 10}"
+                    )
+                    print(f"  [Agent1/Indeed] Page {p + 1}: {url}")
+                    try:
+                        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                        page.wait_for_timeout(4000)
+                        jobs = self._extract(page)
+                        print(f"  [Agent1/Indeed]   → {len(jobs)} jobs")
+                        if not jobs:
+                            break
+                        postings.extend(jobs)
+                        time.sleep(self.delay)
+                    except Exception as exc:
+                        print(f"  [Agent1/Indeed] Error on page {p + 1}: {exc}")
+                        break
+        finally:
+            ctx.close()
         return postings
 
-    def _fetch_rss(self, params: dict) -> list[JobPosting]:
-        try:
-            resp = self.session.get(
-                self.RSS_URL, headers=self._headers(), params=params, timeout=20
-            )
-            resp.raise_for_status()
-        except Exception as exc:
-            print(f"  [Agent1/Indeed] RSS error: {exc}")
-            return []
-
+    def _extract(self, page) -> list[JobPosting]:
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        cards = (
+            soup.select("div.job_seen_beacon") or
+            soup.select("[data-jk]") or
+            soup.select("li[class*='css-']")
+        )
         results = []
-        try:
-            root = ET.fromstring(resp.content)
-        except ET.ParseError as exc:
-            print(f"  [Agent1/Indeed] RSS parse error: {exc}")
-            return []
-
-        ns = ""  # Indeed RSS uses no namespace
-        for item in root.iter("item"):
-            title   = (item.findtext("title") or "").strip()
-            link    = (item.findtext("link")  or "").strip()
-            desc    = unescape(item.findtext("description") or "")
-            company = (item.findtext("source") or "Unknown").strip()
-            pub     = (item.findtext("pubDate") or "").strip()
-
-            if not title or not link:
+        for card in cards:
+            title_el = (
+                card.select_one("h2.jobTitle span[title]") or
+                card.select_one("h2.jobTitle span") or
+                card.select_one("h2[class*='jobTitle']")
+            )
+            if not title_el:
                 continue
-
-            # Strip HTML tags from description
-            jd_text = re.sub(r"<[^>]+>", " ", desc).strip()
-
+            company_el = (
+                card.select_one("[data-testid='company-name']") or
+                card.select_one("[class*='companyName']")
+            )
+            loc_el = (
+                card.select_one("[data-testid='text-location']") or
+                card.select_one("[class*='companyLocation']")
+            )
+            link_el = card.select_one("a[href*='/rc/clk']") or card.select_one("h2 a")
+            title = title_el.get("title") or title_el.get_text(strip=True)
+            href  = link_el.get("href", "") if link_el else ""
+            if href and not href.startswith("http"):
+                href = "https://in.indeed.com" + href
             results.append(JobPosting(
                 platform="indeed",
                 title=title,
-                company=company,
-                location=params.get("l", ""),
-                url=link,
-                jd_text=jd_text,
-                posted_date=pub,
+                company=company_el.get_text(strip=True) if company_el else "Unknown",
+                location=loc_el.get_text(strip=True) if loc_el else location,
+                url=href,
             ))
         return results
 
 
 # ---------------------------------------------------------------------------
-# LinkedIn scraper  (requires authenticated session)
+# LinkedIn scraper  — requests-based guest API (no login, no Playwright)
 # ---------------------------------------------------------------------------
 
 class LinkedInScraper(BaseScraper):
-    """
-    LinkedIn's guest API endpoint for job search.
-    Full JD text requires authentication (session cookies li_at / JSESSIONID).
-    Provide cookies via config['linkedin_cookies'] if available.
-    """
-
     SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 
     def scrape(self, roles: list, seniority_keywords: list, location: str) -> list[JobPosting]:
@@ -236,16 +332,15 @@ class LinkedInScraper(BaseScraper):
                 "  [Agent1/LinkedIn] No session cookies configured. "
                 "Attempting unauthenticated guest search (limited results)."
             )
-
         postings: list[JobPosting] = []
         for role in roles:
             for page_num in range(self.max_pages):
                 params = {
                     "keywords": f"{role} VP",
                     "location": location,
-                    "f_E": "4,5",   # experience: director / VP levels
-                    "start": page_num * 25,
-                    "sortBy": "DD",
+                    "f_E":      "4,5",
+                    "start":    page_num * 25,
+                    "sortBy":   "DD",
                 }
                 print(f"  [Agent1/LinkedIn] Scraping page {page_num + 1} for '{role}'")
                 try:
@@ -274,27 +369,23 @@ class LinkedInScraper(BaseScraper):
 
     def _parse_listing(self, soup: BeautifulSoup) -> list[JobPosting]:
         results = []
-        cards = soup.select("li") or []
-        for card in cards:
-            title_el = card.select_one(".base-search-card__title")
+        for card in soup.select("li") or []:
+            title_el   = card.select_one(".base-search-card__title")
             company_el = card.select_one(".base-search-card__subtitle")
-            location_el = card.select_one(".job-search-card__location")
-            link_el = card.select_one("a.base-card__full-link")
-
+            loc_el     = card.select_one(".job-search-card__location")
+            link_el    = card.select_one("a.base-card__full-link")
             if not title_el:
                 continue
-
             href = link_el.get("href", "") if link_el else ""
-            posting = JobPosting(
+            results.append(JobPosting(
                 platform="linkedin",
                 title=title_el.get_text(strip=True),
                 company=company_el.get_text(strip=True) if company_el else "Unknown",
-                location=location_el.get_text(strip=True) if location_el else "Pune",
+                location=loc_el.get_text(strip=True) if loc_el else location,
                 url=href,
-            )
-            if posting.url:
-                posting.jd_text = self._fetch_jd(posting.url)
-            results.append(posting)
+            ))
+            if href:
+                results[-1].jd_text = self._fetch_jd(href)
         return results
 
     def _fetch_jd(self, url: str) -> str:
@@ -310,38 +401,52 @@ class LinkedInScraper(BaseScraper):
 # ---------------------------------------------------------------------------
 
 class JobDiscoveryAgent:
-    """
-    Coordinates all platform scrapers and returns a de-duplicated list
-    of JobPosting objects.
-    """
-
     def __init__(self, config: dict):
         self.config = config
-        platforms = config.get("search", {}).get("platforms", {})
-        self._scrapers: list[BaseScraper] = []
-        if platforms.get("naukri", True):
-            self._scrapers.append(NaukriScraper(config))
-        if platforms.get("indeed", True):
-            self._scrapers.append(IndeedScraper(config))
-        if platforms.get("linkedin", True):
-            self._scrapers.append(LinkedInScraper(config))
 
     def discover(self) -> list[JobPosting]:
-        search = self.config.get("search", {})
-        roles: list = search.get("roles", ["Product Owner", "Business Analyst"])
-        seniority: list = search.get("seniority", ["VP"])
-        location: str = search.get("location", "Pune")
+        search    = self.config.get("search", {})
+        roles     = search.get("roles", ["Product Owner", "Business Analyst"])
+        seniority = search.get("seniority", ["VP"])
+        location  = search.get("location", "Pune")
+        platforms = search.get("platforms", {})
 
-        print(f"[Agent1] Starting job discovery — roles: {roles}, seniority: {seniority}, location: {location}")
+        print(
+            f"[Agent1] Starting job discovery — roles: {roles}, "
+            f"seniority: {seniority}, location: {location}"
+        )
 
         all_postings: list[JobPosting] = []
-        for scraper in self._scrapers:
+
+        # ── LinkedIn via requests (guest API) ─────────────────────────────
+        if platforms.get("linkedin", True):
             try:
-                jobs = scraper.scrape(roles, seniority, location)
-                print(f"  [Agent1] {scraper.__class__.__name__} found {len(jobs)} postings")
+                jobs = LinkedInScraper(self.config).scrape(roles, seniority, location)
+                print(f"  [Agent1] LinkedInScraper found {len(jobs)} postings")
                 all_postings.extend(jobs)
             except Exception as exc:
-                print(f"  [Agent1] {scraper.__class__.__name__} error: {exc}")
+                print(f"  [Agent1] LinkedInScraper error: {exc}")
+
+        # ── Naukri + Indeed via Playwright ────────────────────────────────
+        needs_pw = platforms.get("naukri", True) or platforms.get("indeed", True)
+        if needs_pw:
+            try:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as pw:
+                    browser = _launch_scraper_browser(pw)
+                    try:
+                        if platforms.get("naukri", True):
+                            jobs = NaukriScraper(self.config, browser).scrape(roles, seniority, location)
+                            print(f"  [Agent1] NaukriScraper found {len(jobs)} postings")
+                            all_postings.extend(jobs)
+                        if platforms.get("indeed", True):
+                            jobs = IndeedScraper(self.config, browser).scrape(roles, seniority, location)
+                            print(f"  [Agent1] IndeedScraper found {len(jobs)} postings")
+                            all_postings.extend(jobs)
+                    finally:
+                        browser.close()
+            except Exception as exc:
+                print(f"  [Agent1] Playwright scraping error: {exc}")
 
         unique = self._deduplicate(all_postings)
         print(f"[Agent1] Discovery complete — {len(unique)} unique postings")
@@ -349,7 +454,7 @@ class JobDiscoveryAgent:
 
     @staticmethod
     def _deduplicate(postings: list[JobPosting]) -> list[JobPosting]:
-        seen: set[str] = set()
+        seen: set = set()
         unique: list[JobPosting] = []
         for p in postings:
             key = (p.company.lower().strip(), p.title.lower().strip())
