@@ -109,8 +109,8 @@ def _replace_run_text(run, new_text: str) -> None:
 
 class ResumeTailoringAgent:
 
-    SKILL_SECTION_NAMES = ["skills", "technical skills", "core competencies", "key skills"]
-    SUMMARY_SECTION_NAMES = ["summary", "profile", "objective", "about"]
+    SKILL_SECTION_NAMES = ["skills", "technical skills", "core competencies", "key skills", "domain expertise"]
+    SUMMARY_SECTION_NAMES = ["summary", "profile", "objective", "about", "professional summary"]
 
     def __init__(self, config: dict):
         self.base_path = Path(config.get("resume", {}).get("base_path", "resume/base_resume.docx"))
@@ -207,7 +207,16 @@ class ResumeTailoringAgent:
     def _find_section(self, doc: Document, candidates: list[str]) -> Optional[int]:
         for i, para in enumerate(doc.paragraphs):
             txt = para.text.strip().lower()
-            if any(c in txt for c in candidates) and para.style.name.lower().startswith("heading"):
+            if not any(c in txt for c in candidates):
+                continue
+            # Match formal Heading styles OR bold/ALL-CAPS Normal paragraphs
+            style = para.style.name.lower()
+            is_heading = style.startswith("heading")
+            is_bold_label = (
+                para.text.strip().isupper() or
+                (para.runs and all(r.bold for r in para.runs if r.text.strip()))
+            )
+            if is_heading or is_bold_label:
                 return i
         return None
 
