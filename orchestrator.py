@@ -27,7 +27,7 @@ import yaml
 
 from agents.agent1_job_discovery import JobDiscoveryAgent, JobPosting
 from agents.agent2_resume_tailoring import ResumeTailoringAgent
-from agents.agent3_application import ApplicationAgent
+from agents.agent3_application import ApplicationAgent, TelegramNotifier
 from agents.agent4_credentials import CredentialManager, load_key_from_env
 
 
@@ -134,6 +134,49 @@ def _checkpoint(filename: str, data) -> None:
     path.write_text(json.dumps(data, indent=2, default=str))
 
 
+def _make_notifier() -> "TelegramNotifier | None":
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat  = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if token and chat:
+        return TelegramNotifier(token, chat)
+    print("[Orchestrator] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — skipping Telegram.")
+    return None
+
+
+def _test_telegram() -> None:
+    notifier = _make_notifier()
+    if not notifier:
+        sys.exit(1)
+    ok = notifier.send("✅ *Telegram test* — Job Application Bot is connected and working!")
+    if ok:
+        print("[Orchestrator] Test message sent successfully. Check your Telegram.")
+    else:
+        print("[Orchestrator] Failed to send test message. Check token and chat ID.")
+        sys.exit(1)
+
+
+def _notify_dry_run(jobs: list) -> None:
+    from datetime import date as _date
+    notifier = _make_notifier()
+    if not notifier:
+        return
+    today = _date.today().isoformat()
+    lines = [f"*Dry-Run Complete — {today}*\n"]
+    lines.append(f"🔍 Jobs discovered: *{len(jobs)}*")
+    for job in jobs[:15]:
+        lines.append(f"  • {job.company} — {job.title} ({job.platform})")
+    if len(jobs) > 15:
+        lines.append(f"  … and {len(jobs) - 15} more")
+    if not jobs:
+        lines.append("  No jobs found (job boards may be blocking the server IP — normal when running in the cloud).")
+    lines.append("\n_Applications were NOT submitted (dry-run mode)._")
+    ok = notifier.send("\n".join(lines))
+    if ok:
+        print("[Orchestrator] Dry-run summary sent to Telegram.")
+    else:
+        print("[Orchestrator] Could not send Telegram summary.")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -150,12 +193,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Run discovery and tailoring only (skip application submission)",
     )
+    parser.add_argument(
+        "--test-telegram",
+        action="store_true",
+        help="Send a test message to Telegram and exit (verifies bot token and chat ID)",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
 
     if args.init_creds:
         init_credentials(cfg)
+    elif args.test_telegram:
+        _test_telegram()
     elif args.dry_run:
         print("[Orchestrator] Dry-run mode — application submission skipped.")
         cred_key = load_key_from_env("CRED_KEY") if os.environ.get("CRED_KEY") else b""
@@ -167,5 +217,6 @@ if __name__ == "__main__":
         for job in jobs:
             agent.tailor(job)
         print("[Orchestrator] Dry-run complete.")
+        _notify_dry_run(jobs)
     else:
         run_pipeline(cfg)
