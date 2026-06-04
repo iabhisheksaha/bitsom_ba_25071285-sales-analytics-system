@@ -43,9 +43,13 @@ class JobPosting:
 # Shared browser launcher (reuses Agent 3 config so proxy is consistent)
 # ---------------------------------------------------------------------------
 
+_CHROMIUM_BIN = os.environ.get(
+    "CHROMIUM_BIN",
+    "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
+)
+
 def _launch_scraper_browser(pw):
-    from agents.agent3_application import CHROMIUM_BIN, SCRAPER_API_KEY as SA_KEY
-    chromium_bin = CHROMIUM_BIN if Path(CHROMIUM_BIN).exists() else None
+    chromium_bin = _CHROMIUM_BIN if Path(_CHROMIUM_BIN).exists() else None
     launch_kwargs = dict(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
@@ -53,11 +57,11 @@ def _launch_scraper_browser(pw):
     )
     if chromium_bin:
         launch_kwargs["executable_path"] = chromium_bin
-    if SA_KEY:
+    if SCRAPER_API_KEY:
         launch_kwargs["proxy"] = {
             "server":   "http://proxy-server.scraperapi.com:8001",
             "username": "scraperapi",
-            "password": SA_KEY,
+            "password": SCRAPER_API_KEY,
         }
     return pw.chromium.launch(**launch_kwargs)
 
@@ -418,18 +422,10 @@ class JobDiscoveryAgent:
 
         all_postings: list[JobPosting] = []
 
-        # ── LinkedIn via requests (guest API) ─────────────────────────────
-        if platforms.get("linkedin", True):
-            try:
-                jobs = LinkedInScraper(self.config).scrape(roles, seniority, location)
-                print(f"  [Agent1] LinkedInScraper found {len(jobs)} postings")
-                all_postings.extend(jobs)
-            except Exception as exc:
-                print(f"  [Agent1] LinkedInScraper error: {exc}")
-
-        # ── Naukri + Indeed via Playwright ────────────────────────────────
+        # ── Naukri + Indeed via Playwright (JS-rendered / bot-protected) ───
         needs_pw = platforms.get("naukri", True) or platforms.get("indeed", True)
         if needs_pw:
+            print("  [Agent1] Launching Playwright browser for Naukri/Indeed…")
             try:
                 from playwright.sync_api import sync_playwright
                 with sync_playwright() as pw:
@@ -446,7 +442,18 @@ class JobDiscoveryAgent:
                     finally:
                         browser.close()
             except Exception as exc:
+                import traceback
                 print(f"  [Agent1] Playwright scraping error: {exc}")
+                traceback.print_exc()
+
+        # ── LinkedIn via requests (guest API) ─────────────────────────────
+        if platforms.get("linkedin", True):
+            try:
+                jobs = LinkedInScraper(self.config).scrape(roles, seniority, location)
+                print(f"  [Agent1] LinkedInScraper found {len(jobs)} postings")
+                all_postings.extend(jobs)
+            except Exception as exc:
+                print(f"  [Agent1] LinkedInScraper error: {exc}")
 
         unique = self._deduplicate(all_postings)
         print(f"[Agent1] Discovery complete — {len(unique)} unique postings")
