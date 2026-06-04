@@ -6,9 +6,12 @@ Business Analyst roles in Pune and returns structured job postings.
 
 import os
 import random
+import re
 import time
 import urllib3
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from html import unescape
 from typing import Optional
 from urllib.parse import quote_plus, urlencode
 
@@ -74,137 +77,143 @@ class BaseScraper:
 
 
 # ---------------------------------------------------------------------------
-# Naukri scraper
+# Naukri scraper  (uses Naukri's JSON search API — no JS rendering needed)
 # ---------------------------------------------------------------------------
 
 class NaukriScraper(BaseScraper):
-    BASE_URL = "https://www.naukri.com"
+    # Naukri's internal JSON API — returns structured job data directly
+    SEARCH_API  = "https://www.naukri.com/jobapi/v3/search"
+    BASE_URL    = "https://www.naukri.com"
+
+    def _api_headers(self) -> dict:
+        return {
+            **self._headers(),
+            "appid":    "109",
+            "systemid": "109",
+            "Accept":   "application/json",
+        }
 
     def scrape(self, roles: list, seniority_keywords: list, location: str) -> list[JobPosting]:
         postings: list[JobPosting] = []
         for role in roles:
-            query = quote_plus(f"{role} {' '.join(seniority_keywords[:2])}")
-            loc = quote_plus(location)
+            keyword = f"{role} {seniority_keywords[0]}"
             for page in range(1, self.max_pages + 1):
-                url = f"{self.BASE_URL}/{query.lower().replace('+', '-')}-jobs-in-{loc.lower()}-{page}"
-                print(f"  [Agent1/Naukri] Scraping page {page}: {url}")
-                soup = self._get(url)
-                if not soup:
-                    break
-                jobs = self._parse_listing(soup, role)
+                params = {
+                    "noOfResults": 20,
+                    "urlType":     "search_by_key_loc",
+                    "searchType":  "adv",
+                    "keyword":     keyword,
+                    "location":    location.lower(),
+                    "pageNo":      page,
+                }
+                print(f"  [Agent1/Naukri] API page {page} for '{keyword}'")
+                jobs = self._fetch_page(params)
                 if not jobs:
                     break
                 postings.extend(jobs)
+                time.sleep(self.request_delay)
         return postings
 
-    def _parse_listing(self, soup: BeautifulSoup, role: str) -> list[JobPosting]:
+    def _fetch_page(self, params: dict) -> list[JobPosting]:
+        try:
+            resp = self.session.get(
+                self.SEARCH_API,
+                headers=self._api_headers(),
+                params=params,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            print(f"  [Agent1/Naukri] API error: {exc}")
+            return []
+
         results = []
-        # Naukri renders job cards with article[type="jobs"] or .jobTuple
-        cards = soup.select("article.jobTuple") or soup.select("[class*='srp-jobtuple']")
-        for card in cards:
-            title_el = card.select_one("a.title") or card.select_one("[class*='title']")
-            company_el = card.select_one("a.subTitle") or card.select_one("[class*='comp-name']")
-            location_el = card.select_one("li.location") or card.select_one("[class*='loc']")
-            link_el = card.select_one("a[href*='naukri.com']") or title_el
-
-            if not title_el:
+        for j in data.get("jobDetails", []):
+            title = j.get("title", "").strip()
+            if not title:
                 continue
-
-            title = title_el.get_text(strip=True)
-            if not self._is_relevant(title, role):
-                continue
-
-            posting = JobPosting(
+            jd_url = j.get("jdURL", "")
+            if jd_url and not jd_url.startswith("http"):
+                jd_url = self.BASE_URL + jd_url
+            jd_text = BeautifulSoup(j.get("jobDescription", ""), "html.parser").get_text("\n")
+            locations = j.get("placeholders", [])
+            loc_str = ", ".join(
+                p.get("label", "") for p in locations if p.get("type") == "location"
+            ) or "Pune"
+            results.append(JobPosting(
                 platform="naukri",
                 title=title,
-                company=company_el.get_text(strip=True) if company_el else "Unknown",
-                location=location_el.get_text(strip=True) if location_el else "Pune",
-                url=link_el.get("href", "") if link_el else "",
-                job_id=card.get("data-job-id", ""),
-            )
-            if posting.url:
-                posting.jd_text = self._fetch_jd(posting.url)
-            results.append(posting)
+                company=j.get("companyName", "Unknown").strip(),
+                location=loc_str,
+                url=jd_url,
+                jd_text=jd_text,
+                job_id=str(j.get("jobId", "")),
+            ))
         return results
-
-    def _fetch_jd(self, url: str) -> str:
-        soup = self._get(url)
-        if not soup:
-            return ""
-        jd_el = soup.select_one("#job-desc") or soup.select_one("[class*='job-desc']")
-        return jd_el.get_text(separator="\n", strip=True) if jd_el else ""
-
-    @staticmethod
-    def _is_relevant(title: str, role: str) -> bool:
-        title_lower = title.lower()
-        role_lower = role.lower()
-        seniority_hints = ["vp", "vice president", "senior vp", "svp", "group vp"]
-        return any(s in title_lower for s in seniority_hints) or role_lower in title_lower
 
 
 # ---------------------------------------------------------------------------
-# Indeed scraper
+# Indeed scraper  (uses Indeed RSS feed — not blocked like the HTML endpoint)
 # ---------------------------------------------------------------------------
 
 class IndeedScraper(BaseScraper):
-    BASE_URL = "https://in.indeed.com/jobs"
+    RSS_URL  = "https://in.indeed.com/rss"
+    BASE_URL = "https://in.indeed.com"
 
     def scrape(self, roles: list, seniority_keywords: list, location: str) -> list[JobPosting]:
         postings: list[JobPosting] = []
         for role in roles:
             query = f"{role} {seniority_keywords[0]}"
-            for page_num in range(self.max_pages):
-                params = {
-                    "q": query,
-                    "l": location,
-                    "start": page_num * 10,
-                    "fromage": 30,  # last 30 days
-                }
-                print(f"  [Agent1/Indeed] Scraping page {page_num + 1} for '{query}'")
-                soup = self._get(self.BASE_URL, params=params)
-                if not soup:
-                    break
-                jobs = self._parse_listing(soup)
-                if not jobs:
-                    break
-                postings.extend(jobs)
+            print(f"  [Agent1/Indeed] RSS feed for '{query}' in {location}")
+            params = {"q": query, "l": location, "fromage": 30, "sort": "date"}
+            jobs = self._fetch_rss(params)
+            print(f"  [Agent1/Indeed]   → {len(jobs)} items")
+            postings.extend(jobs)
+            time.sleep(self.request_delay)
         return postings
 
-    def _parse_listing(self, soup: BeautifulSoup) -> list[JobPosting]:
-        results = []
-        cards = soup.select("div.job_seen_beacon") or soup.select("[class*='jobCard']")
-        for card in cards:
-            title_el = card.select_one("h2.jobTitle span") or card.select_one("h2[class*='jobTitle']")
-            company_el = card.select_one("[class*='companyName']")
-            location_el = card.select_one("[class*='companyLocation']")
-            link_el = card.select_one("a[id^='job_']") or card.select_one("a[href*='/rc/clk']")
+    def _fetch_rss(self, params: dict) -> list[JobPosting]:
+        try:
+            resp = self.session.get(
+                self.RSS_URL, headers=self._headers(), params=params, timeout=20
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"  [Agent1/Indeed] RSS error: {exc}")
+            return []
 
-            if not title_el:
+        results = []
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError as exc:
+            print(f"  [Agent1/Indeed] RSS parse error: {exc}")
+            return []
+
+        ns = ""  # Indeed RSS uses no namespace
+        for item in root.iter("item"):
+            title   = (item.findtext("title") or "").strip()
+            link    = (item.findtext("link")  or "").strip()
+            desc    = unescape(item.findtext("description") or "")
+            company = (item.findtext("source") or "Unknown").strip()
+            pub     = (item.findtext("pubDate") or "").strip()
+
+            if not title or not link:
                 continue
 
-            title = title_el.get_text(strip=True)
-            href = link_el.get("href", "") if link_el else ""
-            if href and not href.startswith("http"):
-                href = "https://in.indeed.com" + href
+            # Strip HTML tags from description
+            jd_text = re.sub(r"<[^>]+>", " ", desc).strip()
 
-            posting = JobPosting(
+            results.append(JobPosting(
                 platform="indeed",
                 title=title,
-                company=company_el.get_text(strip=True) if company_el else "Unknown",
-                location=location_el.get_text(strip=True) if location_el else "Pune",
-                url=href,
-            )
-            if posting.url:
-                posting.jd_text = self._fetch_jd(posting.url)
-            results.append(posting)
+                company=company,
+                location=params.get("l", ""),
+                url=link,
+                jd_text=jd_text,
+                posted_date=pub,
+            ))
         return results
-
-    def _fetch_jd(self, url: str) -> str:
-        soup = self._get(url)
-        if not soup:
-            return ""
-        jd_el = soup.select_one("#jobDescriptionText") or soup.select_one("[class*='jobsearch-jobDescriptionText']")
-        return jd_el.get_text(separator="\n", strip=True) if jd_el else ""
 
 
 # ---------------------------------------------------------------------------
