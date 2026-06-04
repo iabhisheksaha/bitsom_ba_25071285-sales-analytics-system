@@ -198,6 +198,10 @@ def detect_captcha(page: Page) -> bool:
 # Platform-specific handlers
 # ---------------------------------------------------------------------------
 
+class SkipApplication(Exception):
+    """Raised when a job cannot be applied to automatically (e.g. no Easy Apply)."""
+
+
 class BaseApplicationHandler:
     def __init__(self, page: Page):
         self.page = page
@@ -289,6 +293,14 @@ class IndeedHandler(BaseApplicationHandler):
             return False
 
 
+_LINKEDIN_EASY_APPLY_SELECTORS = [
+    "button[aria-label*='Easy Apply']",
+    "button.jobs-apply-button",
+    "button[class*='jobs-apply-button']",
+    "button:has-text('Easy Apply')",
+]
+
+
 class LinkedInHandler(BaseApplicationHandler):
     LOGIN_URL = "https://www.linkedin.com/login"
 
@@ -307,30 +319,52 @@ class LinkedInHandler(BaseApplicationHandler):
             print(f"    [LinkedIn] Login timeout: {exc}")
             return False
 
+    def _find_easy_apply_btn(self):
+        for sel in _LINKEDIN_EASY_APPLY_SELECTORS:
+            try:
+                btn = self.page.query_selector(sel)
+                if btn and btn.is_visible():
+                    return btn
+            except Exception:
+                pass
+        return None
+
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
         try:
             self.page.goto(job.url, timeout=30000)
-            easy_apply = self.page.wait_for_selector(
-                "button[class*='jobs-apply-button']", timeout=15000
-            )
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(3000)
+
+            easy_apply = self._find_easy_apply_btn()
+            if not easy_apply:
+                raise SkipApplication("No Easy Apply button — requires external application")
+
             easy_apply.click()
             self.page.wait_for_timeout(2000)
-            for _ in range(5):
+
+            for _ in range(6):
                 upload = self.page.query_selector("input[type='file']")
                 if upload:
                     upload.set_input_files(str(resume_path.absolute()))
                     self.page.wait_for_timeout(1000)
                 submit_btn = self.page.query_selector("button[aria-label*='Submit']")
-                next_btn = self.page.query_selector("button[aria-label*='Next']")
+                next_btn   = self.page.query_selector("button[aria-label*='Next']")
+                review_btn = self.page.query_selector("button[aria-label*='Review']")
                 if submit_btn:
                     submit_btn.click()
+                    self.page.wait_for_timeout(2000)
                     break
+                elif review_btn:
+                    review_btn.click()
+                    self.page.wait_for_timeout(1000)
                 elif next_btn:
                     next_btn.click()
                     self.page.wait_for_timeout(1000)
                 else:
                     break
             return True
+        except SkipApplication:
+            raise
         except PWTimeout as exc:
             print(f"    [LinkedIn] Apply timeout: {exc}")
             return False
@@ -523,7 +557,12 @@ class ApplicationAgent:
                 self.log.record(job, "failed", "CAPTCHA timeout")
                 return
 
-        success = handler.apply(job, resume_path)
+        try:
+            success = handler.apply(job, resume_path)
+        except SkipApplication as exc:
+            self.log.record(job, "skipped", str(exc))
+            print(f"  [Agent3] SKIPPED — {job.company} ({exc})")
+            return
 
         if success and detect_captcha(page):
             resolved = self._handle_captcha(job, page.url)
