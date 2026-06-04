@@ -1,0 +1,78 @@
+name: Daily Job Application
+
+on:
+  schedule:
+    - cron: '30 3 * * *'  # 9:00 AM IST (UTC+5:30) every day
+  workflow_dispatch:        # Manual trigger from GitHub Actions UI
+
+concurrency:
+  group: daily-job-run
+  cancel-in-progress: false  # Never cancel a run already in progress
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: claude/automated-job-application-j5V3U
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright + system libraries
+        run: |
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+
+      - name: Run pipeline
+        env:
+          CRED_KEY:            ${{ secrets.CRED_KEY }}
+          NAUKRI_USER:         ${{ secrets.NAUKRI_USER }}
+          NAUKRI_PASS:         ${{ secrets.NAUKRI_PASS }}
+          LINKEDIN_USER:       ${{ secrets.LINKEDIN_USER }}
+          LINKEDIN_PASS:       ${{ secrets.LINKEDIN_PASS }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCRAPER_API_KEY:     ${{ secrets.SCRAPER_API_KEY }}
+        run: python orchestrator.py
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
+
+      - name: Telegram alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'EOF'
+          import os, requests
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat  = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if token and chat:
+              run_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              requests.post(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  json={
+                      "chat_id": chat,
+                      "text": f"❌ *Daily job run FAILED*\n\nCheck the logs:\n{run_url}",
+                      "parse_mode": "Markdown",
+                  },
+                  timeout=10,
+              )
+          EOF
