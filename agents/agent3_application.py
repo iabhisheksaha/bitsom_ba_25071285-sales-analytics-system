@@ -25,6 +25,7 @@ CHROMIUM_BIN = os.environ.get(
     "CHROMIUM_BIN",
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
 )
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +424,31 @@ class ApplicationAgent:
         )
         if chromium_bin:
             launch_kwargs["executable_path"] = chromium_bin
+        if SCRAPER_API_KEY:
+            launch_kwargs["proxy"] = {
+                "server": "http://proxy-server.scraperapi.com:8001",
+                "username": "scraperapi",
+                "password": SCRAPER_API_KEY,
+            }
+            print("  [Agent3] ScraperAPI proxy active for browser sessions")
         return playwright.chromium.launch(**launch_kwargs)
+
+    def _new_stealth_page(self, browser: Browser) -> tuple:
+        """Return (context, page) with stealth patches applied."""
+        ctx = browser.new_context(
+            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 768},
+            locale="en-IN",
+        )
+        page = ctx.new_page()
+        try:
+            from playwright_stealth import stealth_sync
+            stealth_sync(page)
+        except ImportError:
+            pass
+        return ctx, page
 
     def run(self, jobs: list[JobPosting], tailored_resumes: dict[str, Path]) -> None:
         print(f"[Agent3] Starting application run for {len(jobs)} jobs")
@@ -462,8 +487,7 @@ class ApplicationAgent:
             return
 
         browser: Browser = self._launch_browser(playwright)
-        ctx = browser.new_context(ignore_https_errors=True)
-        page = ctx.new_page()
+        ctx, page = self._new_stealth_page(browser)
         handler: BaseApplicationHandler = _HANDLER_MAP[platform](page)
 
         try:

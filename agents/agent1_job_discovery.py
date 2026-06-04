@@ -4,14 +4,20 @@ Searches LinkedIn, Indeed, and Naukri.com for VP-level Product Owner /
 Business Analyst roles in Pune and returns structured job postings.
 """
 
+import os
 import random
 import time
+import urllib3
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
 
 import requests
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
 
 @dataclass
@@ -40,6 +46,11 @@ class BaseScraper:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         ])
         self.session = requests.Session()
+        if SCRAPER_API_KEY:
+            _proxy = f"http://scraperapi:{SCRAPER_API_KEY}@proxy-server.scraperapi.com:8001"
+            self.session.proxies.update({"http": _proxy, "https": _proxy})
+            self.session.verify = False
+            print(f"  [Agent1] ScraperAPI proxy active (residential IP routing)")
 
     def _headers(self) -> dict:
         return {
@@ -51,7 +62,7 @@ class BaseScraper:
     def _get(self, url: str, params: dict = None) -> Optional[BeautifulSoup]:
         try:
             time.sleep(self.request_delay + random.uniform(0, 1.5))
-            resp = self.session.get(url, headers=self._headers(), params=params, timeout=15)
+            resp = self.session.get(url, headers=self._headers(), params=params, timeout=30)
             resp.raise_for_status()
             return BeautifulSoup(resp.text, "html.parser")
         except requests.RequestException as exc:

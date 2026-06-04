@@ -47,6 +47,41 @@ def load_config() -> dict:
 # First-time credential setup
 # ---------------------------------------------------------------------------
 
+def setup_creds_from_env(config: dict) -> None:
+    """
+    Non-interactive credential setup for cloud / CI runs.
+    Reads credentials from environment variables:
+        NAUKRI_USER / NAUKRI_PASS
+        LINKEDIN_USER / LINKEDIN_PASS
+        INDEED_USER  / INDEED_PASS
+    Uses the existing CRED_KEY to encrypt them.
+    """
+    cred_key_str = os.environ.get("CRED_KEY", "")
+    if not cred_key_str:
+        print("[Orchestrator] CRED_KEY not set.")
+        sys.exit(1)
+
+    platforms = [p for p, enabled in config.get("search", {}).get("platforms", {}).items() if enabled]
+    credentials: dict = {}
+    for platform in platforms:
+        user = os.environ.get(f"{platform.upper()}_USER", "")
+        pw   = os.environ.get(f"{platform.upper()}_PASS", "")
+        if user and pw:
+            credentials[platform] = {"username": user, "password": pw}
+            print(f"[Orchestrator] Credentials loaded for {platform}")
+        else:
+            print(f"[Orchestrator] {platform.upper()}_USER / _PASS not set — skipping {platform}")
+
+    if not credentials:
+        print("[Orchestrator] No credentials found in environment. Nothing saved.")
+        sys.exit(1)
+
+    cred_path = config.get("credentials", {}).get("encrypted_file", "config/credentials.enc")
+    manager = CredentialManager(cred_path)
+    manager.init_store(cred_key_str.encode(), credentials)
+    print(f"[Orchestrator] credentials.enc written to {cred_path}")
+
+
 def init_credentials(config: dict) -> None:
     """Interactive wizard to create the encrypted credential store."""
     from cryptography.fernet import Fernet
@@ -93,6 +128,12 @@ def run_pipeline(config: dict) -> None:
         sys.exit(1)
 
     cred_path = config.get("credentials", {}).get("encrypted_file", "config/credentials.enc")
+
+    # Auto-bootstrap credentials.enc on first cloud run if env vars are present
+    if not Path(cred_path).exists() and os.environ.get("NAUKRI_USER"):
+        print("[Orchestrator] credentials.enc not found — bootstrapping from env vars…")
+        setup_creds_from_env(config)
+
     credential_manager = CredentialManager(cred_path)
 
     # --- Agent 1: Job Discovery ---
@@ -189,6 +230,11 @@ if __name__ == "__main__":
         help="Interactive wizard to create the encrypted credential store",
     )
     parser.add_argument(
+        "--setup-creds-from-env",
+        action="store_true",
+        help="Non-interactive: create credentials.enc from *_USER/*_PASS env vars (for cloud runs)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run discovery and tailoring only (skip application submission)",
@@ -204,6 +250,8 @@ if __name__ == "__main__":
 
     if args.init_creds:
         init_credentials(cfg)
+    elif args.setup_creds_from_env:
+        setup_creds_from_env(cfg)
     elif args.test_telegram:
         _test_telegram()
     elif args.dry_run:
