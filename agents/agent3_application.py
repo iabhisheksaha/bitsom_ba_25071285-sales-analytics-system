@@ -7,8 +7,11 @@ Uses Playwright for browser automation.
 
 import json
 import os
+import smtplib
 import time
 from datetime import date, datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
@@ -110,6 +113,74 @@ _CAPTCHA_SELECTORS = [
     "#captcha",
     "[data-testid='captcha']",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Email notifier
+# ---------------------------------------------------------------------------
+
+class EmailNotifier:
+    """
+    Sends daily summary and CAPTCHA alerts via email (Gmail / any SMTP).
+    Required env vars:
+        EMAIL_FROM      — sender address (e.g. abhisheksaha@gmail.com)
+        EMAIL_PASSWORD  — app password (Gmail: generate at myaccount.google.com/apppasswords)
+        EMAIL_TO        — recipient address
+        EMAIL_SMTP_HOST — defaults to smtp.gmail.com
+        EMAIL_SMTP_PORT — defaults to 587
+    """
+
+    def __init__(self):
+        self.sender   = os.environ.get("EMAIL_FROM", "")
+        self.password = os.environ.get("EMAIL_PASSWORD", "")
+        self.recipient = os.environ.get("EMAIL_TO", self.sender)
+        self.smtp_host = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
+        self.smtp_port = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
+        self.enabled = bool(self.sender and self.password)
+
+    def _send(self, subject: str, body: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = self.sender
+            msg["To"] = self.recipient
+            msg.attach(MIMEText(body, "plain"))
+            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.sender, self.password)
+                server.sendmail(self.sender, self.recipient, msg.as_string())
+            return True
+        except Exception as exc:
+            print(f"  [Agent3/Email] Send failed: {exc}")
+            return False
+
+    def send_daily_summary(self, submitted: list[dict], failed: list[dict]) -> None:
+        today = date.today().strftime("%d %b %Y")
+        lines = [f"Job Application Summary — {today}\n"]
+        lines.append(f"Submitted: {len(submitted)}")
+        for a in submitted:
+            lines.append(f"  ✓ {a['company']} — {a['title']} ({a['platform']})")
+        if failed:
+            lines.append(f"\nFailed: {len(failed)}")
+            for a in failed:
+                lines.append(f"  ✗ {a['company']}: {a.get('reason','')}")
+        self._send(
+            subject=f"[JobApp] {len(submitted)} applications submitted — {today}",
+            body="\n".join(lines),
+        )
+
+    def send_captcha_alert(self, job, app_url: str) -> None:
+        body = (
+            f"CAPTCHA detected — manual action needed\n\n"
+            f"Company : {job.company}\n"
+            f"Role    : {job.title}\n"
+            f"Platform: {job.platform}\n"
+            f"URL     : {app_url}\n\n"
+            f"Please open the URL, solve the CAPTCHA, then reply to this email."
+        )
+        self._send(subject=f"[JobApp] CAPTCHA needed — {job.company}", body=body)
 
 
 def detect_captcha(page: Page) -> bool:
@@ -339,8 +410,9 @@ class ApplicationAgent:
         self.telegram: Optional[TelegramNotifier] = (
             TelegramNotifier(bot_token, chat_id) if bot_token and chat_id else None
         )
-        if not self.telegram:
-            print("[Agent3] Telegram not configured — CAPTCHA alerts and summaries disabled.")
+        self.email = EmailNotifier()
+        if not self.telegram and not self.email.enabled:
+            print("[Agent3] No notifier configured — set Telegram or Email env vars for alerts.")
 
     def _launch_browser(self, playwright):
         chromium_bin = CHROMIUM_BIN if Path(CHROMIUM_BIN).exists() else None
@@ -368,6 +440,15 @@ class ApplicationAgent:
         print(f"\n[Agent3] Daily totals — submitted: {len(submitted)}, failed: {len(failed)}")
         if self.telegram:
             self.telegram.send_daily_summary(submitted, failed)
+        if self.email.enabled:
+            self.email.send_daily_summary(submitted, failed)
+            print("[Agent3] Daily summary emailed.")
+        # Always write a file report
+        from daily_report import format_report, save_report
+        from datetime import date as _date
+        report = format_report(_date.today(), self.log._data)
+        path = save_report(report, _date.today())
+        print(f"[Agent3] Report saved → {path}")
 
     def _process_platform(self, playwright, platform, jobs, tailored_resumes):
         if platform not in _HANDLER_MAP:

@@ -29,6 +29,15 @@ telegram:
   bot_token_env: "TELEGRAM_BOT_TOKEN"
   chat_id_env: "TELEGRAM_CHAT_ID"
 
+email:
+  # Set these env vars to enable email reports (Gmail recommended)
+  # EMAIL_FROM         — your Gmail address
+  # EMAIL_PASSWORD     — Gmail App Password (not your login password)
+  #                      Generate at: myaccount.google.com/apppasswords
+  # EMAIL_TO           — recipient (can be same as EMAIL_FROM)
+  # EMAIL_SMTP_HOST    — defaults to smtp.gmail.com
+  # EMAIL_SMTP_PORT    — defaults to 587
+
 application:
   log_file: "logs/applications.json"
   # Seconds to wait between applications to avoid rate limiting
