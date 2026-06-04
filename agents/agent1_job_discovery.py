@@ -126,6 +126,12 @@ class NaukriScraper:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             locale="en-IN",
+            viewport={"width": 1366, "height": 768},
+            extra_http_headers={
+                "Accept-Language": "en-IN,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
         page = ctx.new_page()
         try:
@@ -137,16 +143,27 @@ class NaukriScraper:
                     url  = f"{self.BASE_URL}/{slug}-jobs-in-{loc}-{p}"
                     print(f"  [Agent1/Naukri] Page {p}: {url}")
                     try:
-                        page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                        page.wait_for_timeout(4000)
+                        page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                        # Wait for either job cards or the Next.js data script to appear
+                        try:
+                            page.wait_for_selector(
+                                "#__NEXT_DATA__, article.srp-jobtuple-wrapper, [data-job-id]",
+                                timeout=15000,
+                            )
+                        except Exception:
+                            pass  # fall through to debug dump below
+                        page.wait_for_timeout(2000)
                         jobs = self._extract(page, role)
                         print(f"  [Agent1/Naukri]   → {len(jobs)} jobs")
                         if not jobs:
+                            self._debug_dump(page, "naukri")
                             break
                         postings.extend(jobs)
                         time.sleep(self.delay)
                     except Exception as exc:
+                        import traceback
                         print(f"  [Agent1/Naukri] Error on page {p}: {exc}")
+                        traceback.print_exc()
                         break
         finally:
             ctx.close()
@@ -202,6 +219,32 @@ class NaukriScraper:
             job_id=str(j.get("jobId", "")),
         )
 
+    def _debug_dump(self, page, platform: str) -> None:
+        """Save page title + HTML snippet + screenshot to logs/debug/ for diagnosis."""
+        import traceback
+        debug_dir = Path("logs/debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            title = page.title()
+            print(f"  [Agent1/{platform.title()}] DEBUG page title: {title!r}")
+        except Exception:
+            title = "(unknown)"
+        try:
+            html = page.content()
+            snippet = html[:4000]
+            out_html = debug_dir / f"{platform}_page.html"
+            out_html.write_text(html, encoding="utf-8")
+            print(f"  [Agent1/{platform.title()}] DEBUG HTML saved → {out_html} ({len(html)} chars)")
+            print(f"  [Agent1/{platform.title()}] HTML snippet:\n{snippet[:800]}")
+        except Exception as exc:
+            print(f"  [Agent1/{platform.title()}] DEBUG html dump failed: {exc}")
+        try:
+            shot = debug_dir / f"{platform}_screenshot.png"
+            page.screenshot(path=str(shot), full_page=False)
+            print(f"  [Agent1/{platform.title()}] DEBUG screenshot → {shot}")
+        except Exception as exc:
+            print(f"  [Agent1/{platform.title()}] DEBUG screenshot failed: {exc}")
+
     def _parse_html(self, html: str, role: str) -> list[JobPosting]:
         soup = BeautifulSoup(html, "html.parser")
         cards = (
@@ -254,6 +297,11 @@ class IndeedScraper:
             ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 768},
+            extra_http_headers={
+                "Accept-Language": "en-IN,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            },
         )
         page = ctx.new_page()
         try:
@@ -267,20 +315,53 @@ class IndeedScraper:
                     )
                     print(f"  [Agent1/Indeed] Page {p + 1}: {url}")
                     try:
-                        page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                        page.wait_for_timeout(4000)
+                        page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_selector(
+                                "div.job_seen_beacon, [data-jk], #mosaic-jobResults",
+                                timeout=15000,
+                            )
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(2000)
                         jobs = self._extract(page)
                         print(f"  [Agent1/Indeed]   → {len(jobs)} jobs")
                         if not jobs:
+                            self._debug_dump(page, "indeed")
                             break
                         postings.extend(jobs)
                         time.sleep(self.delay)
                     except Exception as exc:
+                        import traceback
                         print(f"  [Agent1/Indeed] Error on page {p + 1}: {exc}")
+                        traceback.print_exc()
                         break
         finally:
             ctx.close()
         return postings
+
+    def _debug_dump(self, page, platform: str) -> None:
+        debug_dir = Path("logs/debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            title = page.title()
+            print(f"  [Agent1/{platform.title()}] DEBUG page title: {title!r}")
+        except Exception:
+            title = "(unknown)"
+        try:
+            html = page.content()
+            out_html = debug_dir / f"{platform}_page.html"
+            out_html.write_text(html, encoding="utf-8")
+            print(f"  [Agent1/{platform.title()}] DEBUG HTML saved → {out_html} ({len(html)} chars)")
+            print(f"  [Agent1/{platform.title()}] HTML snippet:\n{html[:800]}")
+        except Exception as exc:
+            print(f"  [Agent1/{platform.title()}] DEBUG html dump failed: {exc}")
+        try:
+            shot = debug_dir / f"{platform}_screenshot.png"
+            page.screenshot(path=str(shot), full_page=False)
+            print(f"  [Agent1/{platform.title()}] DEBUG screenshot → {shot}")
+        except Exception as exc:
+            print(f"  [Agent1/{platform.title()}] DEBUG screenshot failed: {exc}")
 
     def _extract(self, page) -> list[JobPosting]:
         html = page.content()

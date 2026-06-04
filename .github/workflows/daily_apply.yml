@@ -51,8 +51,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: run-logs-${{ github.run_number }}
-          path: logs/
+          path: |
+            logs/
           retention-days: 30
+
+      - name: Upload scraper debug dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-dumps-${{ github.run_number }}
+          path: logs/debug/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Telegram alert on failure
         if: failure()
