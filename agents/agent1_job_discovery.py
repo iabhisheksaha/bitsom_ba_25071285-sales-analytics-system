@@ -45,7 +45,7 @@ _CHROMIUM_BIN = os.environ.get(
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
 )
 
-def _launch_scraper_browser(pw):
+def _launch_scraper_browser(pw, use_proxy: bool = True):
     chromium_bin = _CHROMIUM_BIN if Path(_CHROMIUM_BIN).exists() else None
     launch_kwargs = dict(
         headless=True,
@@ -54,7 +54,7 @@ def _launch_scraper_browser(pw):
     )
     if chromium_bin:
         launch_kwargs["executable_path"] = chromium_bin
-    if SCRAPER_API_KEY:
+    if use_proxy and SCRAPER_API_KEY:
         launch_kwargs["proxy"] = {
             "server":   "http://proxy-server.scraperapi.com:8001",
             "username": "scraperapi",
@@ -653,23 +653,33 @@ class JobDiscoveryAgent:
 
         all_postings: list[JobPosting] = []
 
-        # ── All platforms via single shared Playwright browser ────────────
-        needs_pw = (
-            platforms.get("naukri", True) or
-            platforms.get("indeed", True) or
-            platforms.get("linkedin", True)
-        )
-        if needs_pw:
-            print("  [Agent1] Launching Playwright browser for all platforms…")
+        # ── Naukri — direct (no proxy; ScraperAPI IPs are blocked by Naukri) ─
+        if platforms.get("naukri", True):
             try:
                 from playwright.sync_api import sync_playwright
+                print("  [Agent1] Launching Playwright browser for Naukri (no proxy)…")
                 with sync_playwright() as pw:
-                    browser = _launch_scraper_browser(pw)
+                    browser = _launch_scraper_browser(pw, use_proxy=False)
                     try:
-                        if platforms.get("naukri", True):
-                            jobs = NaukriScraper(self.config, browser).scrape(roles, seniority, location)
-                            print(f"  [Agent1] NaukriScraper found {len(jobs)} postings")
-                            all_postings.extend(jobs)
+                        jobs = NaukriScraper(self.config, browser).scrape(roles, seniority, location)
+                        print(f"  [Agent1] NaukriScraper found {len(jobs)} postings")
+                        all_postings.extend(jobs)
+                    finally:
+                        browser.close()
+            except Exception as exc:
+                import traceback
+                print(f"  [Agent1] Naukri Playwright error: {exc}")
+                traceback.print_exc()
+
+        # ── Indeed + LinkedIn — via ScraperAPI proxy ───────────────────────
+        needs_proxy_pw = platforms.get("indeed", True) or platforms.get("linkedin", True)
+        if needs_proxy_pw:
+            try:
+                from playwright.sync_api import sync_playwright
+                print("  [Agent1] Launching Playwright browser for Indeed/LinkedIn (proxy)…")
+                with sync_playwright() as pw:
+                    browser = _launch_scraper_browser(pw, use_proxy=True)
+                    try:
                         if platforms.get("indeed", True):
                             jobs = IndeedScraper(self.config, browser).scrape(roles, seniority, location)
                             print(f"  [Agent1] IndeedScraper found {len(jobs)} postings")
@@ -682,7 +692,7 @@ class JobDiscoveryAgent:
                         browser.close()
             except Exception as exc:
                 import traceback
-                print(f"  [Agent1] Playwright scraping error: {exc}")
+                print(f"  [Agent1] Indeed/LinkedIn Playwright error: {exc}")
                 traceback.print_exc()
 
         unique = self._deduplicate(all_postings)

@@ -794,7 +794,22 @@ class ApplicationAgent:
         try:
             creds = self.cred_manager.get_site_credentials(platform, self.cred_key)
         except KeyError:
-            print(f"  [Agent3] No credentials for '{platform}' — skipping.")
+            # No platform login credentials — for some platforms we can still apply
+            # by navigating to each job URL and following the redirect to the company ATS.
+            _DIRECT_URL_PLATFORMS = {"indeed"}
+            if platform in _DIRECT_URL_PLATFORMS:
+                print(f"  [Agent3] No {platform} credentials — trying direct-URL apply for each job.")
+                browser: Browser = self._launch_browser(playwright)
+                ctx, page = self._new_stealth_page(browser)
+                try:
+                    for job in jobs:
+                        self._apply_via_job_url(page, job, tailored_resumes)
+                        time.sleep(self.delay)
+                finally:
+                    ctx.close()
+                    browser.close()
+            else:
+                print(f"  [Agent3] No credentials for '{platform}' — skipping.")
             return
 
         browser: Browser = self._launch_browser(playwright)
@@ -851,6 +866,79 @@ class ApplicationAgent:
         status = "submitted" if success else "failed"
         self.log.record(job, status, "" if success else "apply error")
         print(f"  [Agent3] {status.upper()} — {job.company}")
+
+    def _apply_via_job_url(self, page: Page, job: "JobPosting", tailored_resumes: dict) -> None:
+        """
+        Navigate directly to job.url (e.g. an Indeed tracking link) and attempt
+        to follow through to the company's external ATS page.
+        """
+        key = f"{job.platform}::{job.company}::{job.title}"
+
+        if self.log.already_applied(job):
+            print(f"  [Agent3] Already applied to {job.company} — skipping.")
+            return
+
+        resume_path = tailored_resumes.get(key)
+        if not resume_path or not resume_path.exists():
+            print(f"  [Agent3] No tailored resume for {key} — skipping.")
+            self.log.record(job, "skipped", "no resume")
+            return
+
+        if not job.url:
+            self.log.record(job, "skipped", "no job URL")
+            return
+
+        print(f"  [Agent3] Direct-apply → {job.company} | {job.title}")
+
+        try:
+            page.goto(job.url, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            current_url = page.url
+
+            # Already redirected to a known ATS
+            ats = detect_ats(current_url)
+            if ats:
+                self._handle_external_apply(page, job, resume_path, current_url)
+                return
+
+            # Look for "Apply on company site" / external apply button
+            apply_link = (
+                page.query_selector("a[data-testid='viewJobButtonLinkComponent']") or
+                page.query_selector("a[href*='applyRedirect']") or
+                page.query_selector("a:has-text('Apply on company site')") or
+                page.query_selector("a:has-text('Apply now')") or
+                page.query_selector("button:has-text('Apply on company site')")
+            )
+
+            if not apply_link:
+                print(f"  [Agent3] No external apply link on {current_url[:70]} — skipping.")
+                self.log.record(job, "skipped", "no external apply link")
+                return
+
+            # Follow the link — may open popup or navigate in-place
+            try:
+                with page.context.expect_page(timeout=8000) as popup_info:
+                    apply_link.click()
+                popup = popup_info.value
+                popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                ext_url = popup.url
+                ats = detect_ats(ext_url)
+                if ats:
+                    self._handle_external_apply(popup, job, resume_path, ext_url)
+                else:
+                    self.log.record(job, "skipped", f"unsupported ATS: {ext_url[:60]}")
+            except Exception:
+                page.wait_for_timeout(2000)
+                ext_url = page.url
+                ats = detect_ats(ext_url)
+                if ats:
+                    self._handle_external_apply(page, job, resume_path, ext_url)
+                else:
+                    self.log.record(job, "skipped", f"unsupported ATS at {ext_url[:60]}")
+
+        except Exception as exc:
+            print(f"  [Agent3] Direct-apply error for {job.company}: {exc}")
+            self.log.record(job, "failed", str(exc)[:100])
 
     def _handle_external_apply(self, page: Page, job: "JobPosting",
                                 resume_path: Path, external_url: str) -> None:
