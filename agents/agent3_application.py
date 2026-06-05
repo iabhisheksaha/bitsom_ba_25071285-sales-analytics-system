@@ -1268,8 +1268,8 @@ class ApplicationAgent:
                               session: "Optional[requests.Session]" = None) -> str:
         """Call Naukri's job detail JSON API to get the external apply URL (free)."""
         _HEADERS = {
-            "system-id":  "109",
-            "Appid":      "109",
+            "appid":      "109",
+            "systemid":   "109",
             "clientId":   "d3skt0p",
             "gid":        "LOCATION,INDUSTRY,EDUCATION,FAREA_ROLE",
             "Accept":     "application/json",

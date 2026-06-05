@@ -40,10 +40,12 @@ _DEFAULT_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Headers expected by Naukri's internal JSON API
+# Headers expected by Naukri's internal JSON API.
+# NOTE: header keys must be exactly "appid" / "systemid" (no hyphen) — the API
+# rejects "system-id" with HTTP 400 "Please provide the valid App Id and SystemId".
 _NAUKRI_API_HEADERS = {
-    "system-id":     "109",
-    "Appid":         "109",
+    "appid":         "109",
+    "systemid":      "109",
     "clientId":      "d3skt0p",
     "gid":           "LOCATION,INDUSTRY,EDUCATION,FAREA_ROLE",
     "Content-Type":  "application/json",
