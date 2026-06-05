@@ -159,6 +159,19 @@ CHROMIUM_BIN = os.environ.get(
 )
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
+# ── Browser mode (local vs CI) ─────────────────────────────────────────────
+# HEADLESS=false runs a visible browser (needed for local runs so login
+# checkpoints/CAPTCHAs can be seen and solved once).
+# BROWSER_PROFILE_DIR points at a persistent Chrome profile so LinkedIn/Naukri
+# stay logged in across daily runs — log in once via login_setup.py, and every
+# subsequent run reuses the saved cookies (no repeated login challenges).
+HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
+BROWSER_PROFILE_DIR = os.environ.get("BROWSER_PROFILE_DIR", "")
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 
 # ---------------------------------------------------------------------------
 # Telegram helper
@@ -860,35 +873,62 @@ class ApplicationAgent:
         if not self.telegram and not self.email.enabled:
             print("[Agent3] No notifier configured — set Telegram or Email env vars for alerts.")
 
-    def _launch_browser(self, playwright):
+    def _open_session(self, playwright) -> tuple:
+        """
+        Open a browser session and return (context, page, closer).
+
+        Two modes:
+        - Persistent profile (BROWSER_PROFILE_DIR set): launch_persistent_context
+          so cookies/logins survive across runs. This is the local-run path —
+          you log into LinkedIn/Naukri once via login_setup.py and every daily
+          run reuses that session. `closer()` closes the context.
+        - Ephemeral (CI / no profile): plain launch + fresh context, as before.
+        """
         chromium_bin = CHROMIUM_BIN if Path(CHROMIUM_BIN).exists() else None
-        launch_kwargs = dict(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                  "--ignore-certificate-errors"],
-        )
+        args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                "--ignore-certificate-errors", "--disable-blink-features=AutomationControlled"]
+
+        if BROWSER_PROFILE_DIR:
+            Path(BROWSER_PROFILE_DIR).mkdir(parents=True, exist_ok=True)
+            kwargs = dict(
+                user_data_dir=BROWSER_PROFILE_DIR,
+                headless=HEADLESS,
+                args=args,
+                ignore_https_errors=True,
+                user_agent=_BROWSER_UA,
+                viewport={"width": 1366, "height": 768},
+                locale="en-IN",
+            )
+            if chromium_bin:
+                kwargs["executable_path"] = chromium_bin
+            ctx = playwright.chromium.launch_persistent_context(**kwargs)
+            print(f"  [Agent3] Persistent browser profile: {BROWSER_PROFILE_DIR} "
+                  f"(headless={HEADLESS})")
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            self._apply_stealth(page)
+            return ctx, page, ctx.close
+
+        launch_kwargs = dict(headless=HEADLESS, args=args)
         if chromium_bin:
             launch_kwargs["executable_path"] = chromium_bin
-        # No proxy: ATS sites (LinkedIn, Workday, Greenhouse, Lever) don't need
-        # one, and routing through ScraperAPI burns credits on every page load.
-        return playwright.chromium.launch(**launch_kwargs)
-
-    def _new_stealth_page(self, browser: Browser) -> tuple:
-        """Return (context, page) with stealth patches applied."""
+        browser = playwright.chromium.launch(**launch_kwargs)
         ctx = browser.new_context(
             ignore_https_errors=True,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent=_BROWSER_UA,
             viewport={"width": 1366, "height": 768},
             locale="en-IN",
         )
         page = ctx.new_page()
+        self._apply_stealth(page)
+        return ctx, page, browser.close
+
+    @staticmethod
+    def _apply_stealth(page) -> None:
         try:
             from playwright_stealth import stealth_sync
             stealth_sync(page)
         except ImportError:
             pass
-        return ctx, page
 
     def _get_naukri_session(self) -> "Optional[requests.Session]":
         """Lazily authenticate with Naukri; cache session for the run."""
@@ -936,42 +976,21 @@ class ApplicationAgent:
 
         # Platforms where we apply via job URL → ATS redirect rather than through
         # the platform's own login + apply flow.
-        # - indeed:  no platform login available in credentials.enc
-        # - naukri:  login page is served through Akamai CDN which blocks headless
-        #            browsers; most Naukri listings redirect to company ATS anyway
         _DIRECT_URL_PLATFORMS = {"indeed", "naukri"}
 
-        if platform in _DIRECT_URL_PLATFORMS:
-            print(f"  [Agent3] {platform}: using direct-URL apply (follow job link → company ATS).")
-            browser: Browser = self._launch_browser(playwright)
-            ctx, page = self._new_stealth_page(browser)
-            # Use a shorter delay for direct-URL applies — each job triggers a
-            # ScraperAPI render call rather than an interactive browser session,
-            # so the heavy 30s rate-limit delay is unnecessary here.
-            direct_delay = max(5, self.delay // 6)
-            try:
+        ctx, page, close = self._open_session(playwright)
+        try:
+            if platform in _DIRECT_URL_PLATFORMS:
+                print(f"  [Agent3] {platform}: using direct-URL apply (follow job link → company ATS).")
+                direct_delay = max(5, self.delay // 6)
                 for job in jobs:
                     self._apply_via_job_url(page, job, tailored_resumes)
                     time.sleep(direct_delay)
-            finally:
-                ctx.close()
-                browser.close()
-            return
+                return
 
-        try:
-            creds = self.cred_manager.get_site_credentials(platform, self.cred_key)
-        except KeyError:
-            print(f"  [Agent3] No credentials for '{platform}' — skipping.")
-            return
-
-        browser: Browser = self._launch_browser(playwright)
-        ctx, page = self._new_stealth_page(browser)
-        handler: BaseApplicationHandler = _HANDLER_MAP[platform](page)
-
-        try:
-            logged_in = handler.login(creds.get("username", ""), creds.get("password", ""))
-            if not logged_in:
-                print(f"  [Agent3] Login failed for {platform} — falling back to direct-URL apply.")
+            handler: BaseApplicationHandler = _HANDLER_MAP[platform](page)
+            if not self._ensure_logged_in(platform, handler, page):
+                print(f"  [Agent3] Not logged in to {platform} — falling back to direct-URL apply.")
                 for job in jobs:
                     self._apply_via_job_url(page, job, tailored_resumes)
                     time.sleep(max(5, self.delay // 6))
@@ -981,7 +1000,32 @@ class ApplicationAgent:
                 self._apply_to_job(handler, page, job, tailored_resumes)
                 time.sleep(self.delay)
         finally:
-            browser.close()
+            close()
+
+    def _ensure_logged_in(self, platform: str, handler, page) -> bool:
+        """
+        Ensure we're logged in to the platform. With a persistent profile the
+        session cookie usually survives from a previous login_setup.py run, so
+        we check that first and skip the credential login entirely.
+        """
+        if BROWSER_PROFILE_DIR and platform == "linkedin":
+            try:
+                page.goto("https://www.linkedin.com/feed/", timeout=30000,
+                          wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                if "/feed" in page.url and "login" not in page.url and "authwall" not in page.url:
+                    print("  [Agent3] LinkedIn already logged in (persistent profile).")
+                    return True
+                print("  [Agent3] LinkedIn persistent session not active — trying credential login.")
+            except Exception as exc:
+                print(f"  [Agent3] LinkedIn session check failed: {exc}")
+
+        try:
+            creds = self.cred_manager.get_site_credentials(platform, self.cred_key)
+        except (KeyError, FileNotFoundError):
+            print(f"  [Agent3] No stored credentials for '{platform}'.")
+            return False
+        return handler.login(creds.get("username", ""), creds.get("password", ""))
 
     def _apply_to_job(self, handler, page, job, tailored_resumes):
         key = f"{job.platform}::{job.company}::{job.title}"

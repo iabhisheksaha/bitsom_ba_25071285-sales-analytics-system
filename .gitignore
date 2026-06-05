@@ -14,6 +14,10 @@ config/credentials.enc
 .env
 .env.*
 
+# Browser profile — contains live LinkedIn/Naukri session cookies. NEVER commit.
+browser_profile/
+**/browser_profile/
+
 # Tailored resumes (generated at runtime)
 resume/tailored/*.docx
 

@@ -27,6 +27,15 @@ $env:CRED_KEY           = Get-VaultSecret "JobApp_CRED_KEY"
 $env:TELEGRAM_BOT_TOKEN = Get-VaultSecret "JobApp_TELEGRAM_BOT_TOKEN"
 $env:TELEGRAM_CHAT_ID   = Get-VaultSecret "JobApp_TELEGRAM_CHAT_ID"
 
+# ── Local-run browser settings ──────────────────────────────────────────────
+# Running on your own machine (residential IP) is what makes LinkedIn/Naukri
+# actually work. Use a VISIBLE browser with a persistent profile so the
+# logged-in session (set up once via login_setup.py) is reused every run.
+$env:HEADLESS            = "false"
+$env:BROWSER_PROFILE_DIR = "$JobAppDir\browser_profile"
+# Not using ScraperAPI for local runs — clear it so the browser isn't proxied.
+Remove-Item Env:\SCRAPER_API_KEY -ErrorAction SilentlyContinue
+
 # ── Pull latest code ────────────────────────────────────────────────────────
 git pull origin claude/automated-job-application-j5V3U
 
@@ -42,3 +51,5 @@ python orchestrator.py 2>&1 | Tee-Object -Append -FilePath "$JobAppDir\logs\sche
 Remove-Item Env:\CRED_KEY           -ErrorAction SilentlyContinue
 Remove-Item Env:\TELEGRAM_BOT_TOKEN -ErrorAction SilentlyContinue
 Remove-Item Env:\TELEGRAM_CHAT_ID   -ErrorAction SilentlyContinue
+Remove-Item Env:\BROWSER_PROFILE_DIR -ErrorAction SilentlyContinue
+Remove-Item Env:\HEADLESS           -ErrorAction SilentlyContinue
