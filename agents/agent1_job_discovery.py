@@ -12,7 +12,6 @@ import os
 import random
 import re
 import time
-import urllib3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -20,8 +19,6 @@ from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
@@ -141,20 +138,32 @@ class NaukriScraper:
         try:
             print("  [Agent1/Naukri] Logging in…")
             page.goto(self.LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
-            # Email field
-            page.fill("input[placeholder*='Email'], input[type='email'], #usernameField", username, timeout=8000)
+            page.wait_for_timeout(3000)
+            print(f"  [Agent1/Naukri] Login page URL: {page.url!r}, title: {page.title()!r}")
+            # Email — Naukri uses name="username" or placeholder variations
+            email_sel = (
+                "input[name='username'], input[type='email'], "
+                "input[placeholder*='Email'], input[placeholder*='email'], "
+                "#usernameField"
+            )
+            page.fill(email_sel, username, timeout=10000)
             page.wait_for_timeout(500)
-            # Password field
-            page.fill("input[type='password'], #passwordField", password, timeout=8000)
+            # Password
+            page.fill("input[type='password'], input[name='password']", password, timeout=8000)
             page.wait_for_timeout(500)
             # Submit
-            page.click("button[type='submit'], input[type='submit']", timeout=8000)
-            # Wait for redirect away from login page
-            page.wait_for_url(lambda url: "login" not in url, timeout=15000)
-            print("  [Agent1/Naukri] Login successful")
-            page.wait_for_timeout(2000)
-            return True
+            page.click(
+                "button[type='submit'], input[type='submit'], "
+                "button:has-text('Login'), button:has-text('Sign in')",
+                timeout=8000,
+            )
+            page.wait_for_timeout(3000)
+            final_url = page.url
+            if "login" not in final_url:
+                print(f"  [Agent1/Naukri] Login successful → {final_url!r}")
+                return True
+            print(f"  [Agent1/Naukri] Still on login page after submit — continuing as guest ({final_url!r})")
+            return False
         except Exception as exc:
             print(f"  [Agent1/Naukri] Login attempt failed (continuing as guest): {exc}")
             return False
@@ -189,10 +198,13 @@ class NaukriScraper:
                         try:
                             page.wait_for_selector(
                                 "#__NEXT_DATA__, article.srp-jobtuple-wrapper, [data-job-id]",
-                                timeout=15000,
+                                timeout=20000,
                             )
                         except Exception:
                             pass  # fall through to debug dump below
+                        final_url = page.url
+                        if final_url != url:
+                            print(f"  [Agent1/Naukri] Redirected → {final_url!r}")
                         page.wait_for_timeout(2000)
                         jobs = self._extract(page, role)
                         print(f"  [Agent1/Naukri]   → {len(jobs)} jobs")
@@ -430,95 +442,178 @@ class IndeedScraper:
     def _extract(self, page) -> list[JobPosting]:
         html = page.content()
         soup = BeautifulSoup(html, "html.parser")
-        cards = (
-            soup.select("div.job_seen_beacon") or
-            soup.select("[data-jk]") or
-            soup.select("li[class*='css-']")
-        )
-        results = []
-        for card in cards:
-            title_el = (
-                card.select_one("h2.jobTitle span[title]") or
-                card.select_one("h2.jobTitle span") or
-                card.select_one("h2[class*='jobTitle']")
-            )
-            if not title_el:
+
+        # Indeed's job links always carry a data-jk attribute (job key).
+        # Walk UP from each link to find company/location in the enclosing card.
+        seen_jk: set = set()
+        results: list[JobPosting] = []
+
+        for link in soup.find_all("a", {"data-jk": True}):
+            jk = link.get("data-jk", "")
+            if not jk or jk in seen_jk:
                 continue
-            company_el = (
-                card.select_one("[data-testid='company-name']") or
-                card.select_one("[class*='companyName']")
-            )
-            loc_el = (
-                card.select_one("[data-testid='text-location']") or
-                card.select_one("[class*='companyLocation']")
-            )
-            link_el = card.select_one("a[href*='/rc/clk']") or card.select_one("h2 a")
-            title = title_el.get("title") or title_el.get_text(strip=True)
-            href  = link_el.get("href", "") if link_el else ""
+            seen_jk.add(jk)
+
+            href = link.get("href", "")
             if href and not href.startswith("http"):
                 href = "https://in.indeed.com" + href
+
+            # Title is in a span[title] or the first span inside the <a>
+            title_span = link.find("span", {"title": True}) or link.find("span")
+            title = ""
+            if title_span:
+                title = title_span.get("title") or title_span.get_text(strip=True)
+            if not title:
+                title = link.get_text(strip=True)
+            if not title:
+                continue
+
+            # Walk up to find the card container holding company / location
+            company = "Unknown"
+            location = "Pune"
+            node = link.parent
+            for _ in range(10):
+                if node is None:
+                    break
+                company_el = node.find(attrs={"data-testid": "company-name"})
+                if company_el:
+                    company = company_el.get_text(strip=True)
+                    loc_el = node.find(attrs={"data-testid": "text-location"})
+                    if loc_el:
+                        location = loc_el.get_text(strip=True)
+                    break
+                node = node.parent
+
             results.append(JobPosting(
                 platform="indeed",
                 title=title,
-                company=company_el.get_text(strip=True) if company_el else "Unknown",
-                location=loc_el.get_text(strip=True) if loc_el else location,
+                company=company,
+                location=location,
                 url=href,
+                job_id=jk,
             ))
+
         return results
 
 
 # ---------------------------------------------------------------------------
-# LinkedIn scraper  — requests-based guest API (no login, no Playwright)
+# LinkedIn scraper  — Playwright (requests guest API returns 403)
 # ---------------------------------------------------------------------------
 
-class LinkedInScraper(BaseScraper):
-    SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+class LinkedInScraper:
+    SEARCH_URL = "https://www.linkedin.com/jobs/search"
+
+    def __init__(self, config: dict, browser):
+        self.config = config
+        self.browser = browser
+        self.max_pages = config.get("scraping", {}).get("max_pages_per_platform", 5)
+        self.delay = config.get("scraping", {}).get("request_delay", 3)
+
+    def _try_login(self, page) -> bool:
+        try:
+            from agents.agent4_credentials import CredentialManager, load_key_from_env
+            key  = load_key_from_env("CRED_KEY")
+            mgr  = CredentialManager(self.config.get("credentials", {}).get("encrypted_file", "config/credentials.enc"))
+            cred = mgr.get_site_credentials("linkedin", key)
+            username = cred.get("username", "")
+            password = cred.get("password", "")
+            if not username or not password:
+                return False
+        except Exception as exc:
+            print(f"  [Agent1/LinkedIn] Credentials unavailable, scraping public listings: {exc}")
+            return False
+
+        try:
+            print("  [Agent1/LinkedIn] Logging in…")
+            page.goto("https://www.linkedin.com/login", timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            page.fill("input[name='session_key'], #username", username, timeout=10000)
+            page.fill("input[name='session_password'], #password", password, timeout=8000)
+            page.click("button[type='submit'], button[data-litms-control-urn*='login']", timeout=8000)
+            page.wait_for_timeout(4000)
+            final_url = page.url
+            if "feed" in final_url or "jobs" in final_url or "linkedin.com/in/" in final_url:
+                print(f"  [Agent1/LinkedIn] Login successful → {final_url!r}")
+                return True
+            print(f"  [Agent1/LinkedIn] Login may have failed ({final_url!r}), continuing anyway")
+            return False
+        except Exception as exc:
+            print(f"  [Agent1/LinkedIn] Login failed (continuing as guest): {exc}")
+            return False
 
     def scrape(self, roles: list, seniority_keywords: list, location: str) -> list[JobPosting]:
-        cookies = self.config.get("linkedin_cookies", {})
-        if not cookies:
-            print(
-                "  [Agent1/LinkedIn] No session cookies configured. "
-                "Attempting unauthenticated guest search (limited results)."
-            )
         postings: list[JobPosting] = []
-        for role in roles:
-            for page_num in range(self.max_pages):
-                params = {
-                    "keywords": f"{role} VP",
-                    "location": location,
-                    "f_E":      "4,5",
-                    "start":    page_num * 25,
-                    "sortBy":   "DD",
-                }
-                print(f"  [Agent1/LinkedIn] Scraping page {page_num + 1} for '{role}'")
-                try:
-                    time.sleep(self.request_delay + random.uniform(0, 2))
-                    resp = self.session.get(
-                        self.SEARCH_URL,
-                        headers=self._headers(),
-                        params=params,
-                        cookies=cookies,
-                        timeout=15,
+        ctx = self.browser.new_context(
+            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 768},
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        page = ctx.new_page()
+        try:
+            self._try_login(page)
+            for role in roles:
+                query = f"{role} {seniority_keywords[0]}"
+                for p in range(self.max_pages):
+                    url = (
+                        f"{self.SEARCH_URL}"
+                        f"?keywords={quote_plus(query)}"
+                        f"&location={quote_plus(location)}"
+                        f"&f_E=4,5&sortBy=DD&position=1&pageNum={p}"
                     )
-                    if resp.status_code == 429:
-                        print("  [Agent1/LinkedIn] Rate limited — backing off 60s")
-                        time.sleep(60)
-                        continue
-                    resp.raise_for_status()
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    jobs = self._parse_listing(soup)
-                    if not jobs:
+                    print(f"  [Agent1/LinkedIn] Page {p + 1}: {url}")
+                    try:
+                        page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_selector(
+                                "ul.jobs-search__results-list, .base-card, .job-search-card",
+                                timeout=15000,
+                            )
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(2000)
+                        jobs = self._extract(page, location)
+                        print(f"  [Agent1/LinkedIn]   → {len(jobs)} jobs")
+                        if not jobs:
+                            self._debug_dump(page, "linkedin")
+                            break
+                        postings.extend(jobs)
+                        time.sleep(self.delay)
+                    except Exception as exc:
+                        import traceback
+                        print(f"  [Agent1/LinkedIn] Error on page {p + 1}: {exc}")
+                        traceback.print_exc()
                         break
-                    postings.extend(jobs)
-                except requests.RequestException as exc:
-                    print(f"  [Agent1/LinkedIn] Request error: {exc}")
-                    break
+        finally:
+            ctx.close()
         return postings
 
-    def _parse_listing(self, soup: BeautifulSoup) -> list[JobPosting]:
+    def _debug_dump(self, page, platform: str) -> None:
+        debug_dir = Path("logs/debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            title = page.title()
+            print(f"  [Agent1/{platform.title()}] DEBUG title: {title!r}")
+        except Exception:
+            pass
+        try:
+            html = page.content()
+            (debug_dir / f"{platform}_page.html").write_text(html, encoding="utf-8")
+            print(f"  [Agent1/{platform.title()}] DEBUG HTML saved ({len(html)} chars)")
+        except Exception:
+            pass
+        try:
+            page.screenshot(path=str(debug_dir / f"{platform}_screenshot.png"), full_page=False)
+            print(f"  [Agent1/{platform.title()}] DEBUG screenshot saved")
+        except Exception:
+            pass
+
+    def _extract(self, page, location: str) -> list[JobPosting]:
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
         results = []
-        for card in soup.select("li") or []:
+        for card in soup.select("li.jobs-search__results-list > *, .base-card, .job-search-card"):
             title_el   = card.select_one(".base-search-card__title")
             company_el = card.select_one(".base-search-card__subtitle")
             loc_el     = card.select_one(".job-search-card__location")
@@ -533,16 +628,7 @@ class LinkedInScraper(BaseScraper):
                 location=loc_el.get_text(strip=True) if loc_el else location,
                 url=href,
             ))
-            if href:
-                results[-1].jd_text = self._fetch_jd(href)
         return results
-
-    def _fetch_jd(self, url: str) -> str:
-        soup = self._get(url)
-        if not soup:
-            return ""
-        jd_el = soup.select_one(".show-more-less-html__markup") or soup.select_one("[class*='description']")
-        return jd_el.get_text(separator="\n", strip=True) if jd_el else ""
 
 
 # ---------------------------------------------------------------------------
@@ -567,10 +653,14 @@ class JobDiscoveryAgent:
 
         all_postings: list[JobPosting] = []
 
-        # ── Naukri + Indeed via Playwright (JS-rendered / bot-protected) ───
-        needs_pw = platforms.get("naukri", True) or platforms.get("indeed", True)
+        # ── All platforms via single shared Playwright browser ────────────
+        needs_pw = (
+            platforms.get("naukri", True) or
+            platforms.get("indeed", True) or
+            platforms.get("linkedin", True)
+        )
         if needs_pw:
-            print("  [Agent1] Launching Playwright browser for Naukri/Indeed…")
+            print("  [Agent1] Launching Playwright browser for all platforms…")
             try:
                 from playwright.sync_api import sync_playwright
                 with sync_playwright() as pw:
@@ -584,21 +674,16 @@ class JobDiscoveryAgent:
                             jobs = IndeedScraper(self.config, browser).scrape(roles, seniority, location)
                             print(f"  [Agent1] IndeedScraper found {len(jobs)} postings")
                             all_postings.extend(jobs)
+                        if platforms.get("linkedin", True):
+                            jobs = LinkedInScraper(self.config, browser).scrape(roles, seniority, location)
+                            print(f"  [Agent1] LinkedInScraper found {len(jobs)} postings")
+                            all_postings.extend(jobs)
                     finally:
                         browser.close()
             except Exception as exc:
                 import traceback
                 print(f"  [Agent1] Playwright scraping error: {exc}")
                 traceback.print_exc()
-
-        # ── LinkedIn via requests (guest API) ─────────────────────────────
-        if platforms.get("linkedin", True):
-            try:
-                jobs = LinkedInScraper(self.config).scrape(roles, seniority, location)
-                print(f"  [Agent1] LinkedInScraper found {len(jobs)} postings")
-                all_postings.extend(jobs)
-            except Exception as exc:
-                print(f"  [Agent1] LinkedInScraper error: {exc}")
 
         unique = self._deduplicate(all_postings)
         print(f"[Agent1] Discovery complete — {len(unique)} unique postings")
