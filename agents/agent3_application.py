@@ -40,6 +40,57 @@ _ATS_URL_RE = re.compile(
 
 _NAUKRI_LOGIN_URL = "https://www.naukri.com/central-login-services/v2/login"
 
+_LINKEDIN_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _linkedin_offsite_apply_url(job_url: str) -> str:
+    """
+    Resolve a LinkedIn job-view URL to the external company apply URL.
+
+    LinkedIn's guest job-posting page embeds the off-site apply URL in a hidden
+    <code id="applyUrl"> element (wrapped in an HTML comment) for jobs that
+    "apply on company website". This is fetchable with a plain HTTP request —
+    no login, no proxy, no credits. Returns "" for Easy-Apply (on-site) jobs.
+    """
+    import re as _re
+    import json as _json
+    from bs4 import BeautifulSoup as _BS, Comment as _Comment
+
+    m = _re.search(r"(\d{6,})", job_url)
+    if not m:
+        return ""
+    job_id = m.group(1)
+    api = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+    try:
+        resp = requests.get(
+            api,
+            headers={"User-Agent": _LINKEDIN_UA, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=20,
+        )
+        if not resp.ok:
+            print(f"  [Agent3/LinkedIn] Guest API HTTP {resp.status_code} for job {job_id}")
+            return ""
+    except requests.RequestException as exc:
+        print(f"  [Agent3/LinkedIn] Guest API error for job {job_id}: {exc}")
+        return ""
+
+    html = resp.text
+    soup = _BS(html, "html.parser")
+    code = soup.find("code", id="applyUrl")
+    if code:
+        comment = next((c for c in code.children if isinstance(c, _Comment)), None)
+        raw = (str(comment) if comment else code.get_text()).strip()
+        try:
+            url = _json.loads(raw)
+        except Exception:
+            url = raw.strip().strip('"')
+        if isinstance(url, str) and url.startswith("http"):
+            return url
+    return ""
+
 
 def _naukri_login(username: str, password: str) -> "Optional[requests.Session]":
     """POST to Naukri login API; return an authenticated session or None."""
@@ -1007,6 +1058,31 @@ class ApplicationAgent:
             self._apply_naukri_via_render(page, job, resume_path)
             return
 
+        # ── LinkedIn: resolve off-site apply URL via guest API ─────────────
+        if job.platform == "linkedin":
+            # 1. Cheap HTTP guest API
+            ext_url = _linkedin_offsite_apply_url(job.url)
+            # 2. Fall back to loading the job-view page in the real browser
+            if not ext_url:
+                ext_url = self._linkedin_apply_url_via_browser(page, job.url)
+            if not ext_url:
+                print(f"  [Agent3/LinkedIn] No off-site apply URL (Easy-Apply only) — skipping {job.company}.")
+                self.log.record(job, "skipped", "linkedin: easy-apply only (no off-site URL)")
+                return
+            ats = detect_ats(ext_url)
+            if not ats:
+                print(f"  [Agent3/LinkedIn] Off-site URL not a supported ATS: {ext_url[:70]}")
+                self.log.record(job, "skipped", f"linkedin off-site unsupported ATS: {ext_url[:50]}")
+                return
+            print(f"  [Agent3/LinkedIn] Off-site apply URL ({ats}): {ext_url[:70]}")
+            try:
+                page.goto(ext_url, timeout=30000, wait_until="domcontentloaded")
+                self._handle_external_apply(page, job, resume_path, ext_url)
+            except Exception as exc:
+                print(f"  [Agent3/LinkedIn] ATS navigate error for {job.company}: {exc}")
+                self.log.record(job, "failed", str(exc)[:100])
+            return
+
         # ── All other platforms: Playwright navigation approach ────────────
         try:
             page.goto(job.url, timeout=30000, wait_until="domcontentloaded")
@@ -1054,6 +1130,32 @@ class ApplicationAgent:
         except Exception as exc:
             print(f"  [Agent3] Direct-apply error for {job.company}: {exc}")
             self.log.record(job, "failed", str(exc)[:100])
+
+    def _linkedin_apply_url_via_browser(self, page: Page, job_url: str) -> str:
+        """
+        Load a LinkedIn job-view page in the real browser and extract the
+        off-site apply URL from the hidden <code id="applyUrl"> block.
+        Used as a fallback when the guest HTTP API is blocked (403).
+        """
+        import re as _re
+        import json as _json
+        try:
+            page.goto(job_url, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            html = page.content()
+        except Exception as exc:
+            print(f"  [Agent3/LinkedIn] Browser load failed for {job_url[:60]}: {exc}")
+            return ""
+        m = _re.search(r'id="applyUrl"[^>]*>\s*<!--\s*(.*?)\s*-->', html, _re.DOTALL)
+        if m:
+            raw = m.group(1).strip()
+            try:
+                url = _json.loads(raw)
+            except Exception:
+                url = raw.strip().strip('"')
+            if isinstance(url, str) and url.startswith("http"):
+                return url
+        return ""
 
     def _apply_naukri_via_render(self, page: Page, job: "JobPosting", resume_path: Path) -> None:
         """
@@ -1217,6 +1319,12 @@ class ApplicationAgent:
                 if not self.telegram:
                     print(f"  [Agent3] No {ats.title()} credentials and Telegram not set — skipping.")
                     self.log.record(job, "skipped", f"no {ats} credentials")
+                    return
+                # In CI (non-interactive) skip login-required ATS to avoid hanging
+                # the run on per-job Telegram credential prompts (10 min each).
+                if os.environ.get("CI") == "true":
+                    print(f"  [Agent3] {ats.title()} needs an account; no stored creds (CI) — skipping {job.company}.")
+                    self.log.record(job, "skipped", f"{ats} needs account (no stored creds)")
                     return
                 creds = self.telegram.request_credentials(
                     ats, external_url, job, self.creds_request_timeout
