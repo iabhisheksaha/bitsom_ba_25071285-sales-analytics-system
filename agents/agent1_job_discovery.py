@@ -45,7 +45,7 @@ _CHROMIUM_BIN = os.environ.get(
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
 )
 
-def _launch_scraper_browser(pw, use_proxy: bool = True):
+def _launch_scraper_browser(pw, use_proxy: bool = True, ultra_premium: bool = False):
     chromium_bin = _CHROMIUM_BIN if Path(_CHROMIUM_BIN).exists() else None
     launch_kwargs = dict(
         headless=True,
@@ -55,11 +55,16 @@ def _launch_scraper_browser(pw, use_proxy: bool = True):
     if chromium_bin:
         launch_kwargs["executable_path"] = chromium_bin
     if use_proxy and SCRAPER_API_KEY:
+        # ultra_premium uses the highest-quality residential IPs with per-request
+        # rotation — needed for Indeed/LinkedIn which detect shared IPs.
+        proxy_user = "scraperapi.ultra_premium=true" if ultra_premium else "scraperapi"
         launch_kwargs["proxy"] = {
             "server":   "http://proxy-server.scraperapi.com:8001",
-            "username": "scraperapi",
+            "username": proxy_user,
             "password": SCRAPER_API_KEY,
         }
+        tier = "ultra_premium" if ultra_premium else "standard"
+        print(f"  [Agent1] ScraperAPI proxy active ({tier})")
     return pw.chromium.launch(**launch_kwargs)
 
 
@@ -653,13 +658,16 @@ class JobDiscoveryAgent:
 
         all_postings: list[JobPosting] = []
 
-        # ── Naukri — direct (no proxy; ScraperAPI IPs are blocked by Naukri) ─
+        # ── Naukri — ScraperAPI standard proxy ────────────────────────────
+        # Direct GitHub Actions IPs are Akamai-blocked; standard ScraperAPI
+        # at least reaches Naukri's servers (partial content), ultra_premium
+        # may eventually break through fully.
         if platforms.get("naukri", True):
             try:
                 from playwright.sync_api import sync_playwright
-                print("  [Agent1] Launching Playwright browser for Naukri (no proxy)…")
+                print("  [Agent1] Launching Playwright browser for Naukri (ScraperAPI standard)…")
                 with sync_playwright() as pw:
-                    browser = _launch_scraper_browser(pw, use_proxy=False)
+                    browser = _launch_scraper_browser(pw, use_proxy=True, ultra_premium=False)
                     try:
                         jobs = NaukriScraper(self.config, browser).scrape(roles, seniority, location)
                         print(f"  [Agent1] NaukriScraper found {len(jobs)} postings")
@@ -671,14 +679,16 @@ class JobDiscoveryAgent:
                 print(f"  [Agent1] Naukri Playwright error: {exc}")
                 traceback.print_exc()
 
-        # ── Indeed + LinkedIn — via ScraperAPI proxy ───────────────────────
+        # ── Indeed + LinkedIn — ScraperAPI ultra_premium ──────────────────
+        # Indeed and LinkedIn detect shared/repeated IPs. ultra_premium rotates
+        # a fresh residential IP on each request, bypassing "multiple users" errors.
         needs_proxy_pw = platforms.get("indeed", True) or platforms.get("linkedin", True)
         if needs_proxy_pw:
             try:
                 from playwright.sync_api import sync_playwright
-                print("  [Agent1] Launching Playwright browser for Indeed/LinkedIn (proxy)…")
+                print("  [Agent1] Launching Playwright browser for Indeed/LinkedIn (ultra_premium)…")
                 with sync_playwright() as pw:
-                    browser = _launch_scraper_browser(pw, use_proxy=True)
+                    browser = _launch_scraper_browser(pw, use_proxy=True, ultra_premium=True)
                     try:
                         if platforms.get("indeed", True):
                             jobs = IndeedScraper(self.config, browser).scrape(roles, seniority, location)
