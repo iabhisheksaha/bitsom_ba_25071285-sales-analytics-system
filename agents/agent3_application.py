@@ -791,25 +791,30 @@ class ApplicationAgent:
             print(f"  [Agent3] No handler for '{platform}' — skipping.")
             return
 
+        # Platforms where we apply via job URL → ATS redirect rather than through
+        # the platform's own login + apply flow.
+        # - indeed:  no platform login available in credentials.enc
+        # - naukri:  login page is served through Akamai CDN which blocks headless
+        #            browsers; most Naukri listings redirect to company ATS anyway
+        _DIRECT_URL_PLATFORMS = {"indeed", "naukri"}
+
+        if platform in _DIRECT_URL_PLATFORMS:
+            print(f"  [Agent3] {platform}: using direct-URL apply (follow job link → company ATS).")
+            browser: Browser = self._launch_browser(playwright)
+            ctx, page = self._new_stealth_page(browser)
+            try:
+                for job in jobs:
+                    self._apply_via_job_url(page, job, tailored_resumes)
+                    time.sleep(self.delay)
+            finally:
+                ctx.close()
+                browser.close()
+            return
+
         try:
             creds = self.cred_manager.get_site_credentials(platform, self.cred_key)
         except KeyError:
-            # No platform login credentials — for some platforms we can still apply
-            # by navigating to each job URL and following the redirect to the company ATS.
-            _DIRECT_URL_PLATFORMS = {"indeed"}
-            if platform in _DIRECT_URL_PLATFORMS:
-                print(f"  [Agent3] No {platform} credentials — trying direct-URL apply for each job.")
-                browser: Browser = self._launch_browser(playwright)
-                ctx, page = self._new_stealth_page(browser)
-                try:
-                    for job in jobs:
-                        self._apply_via_job_url(page, job, tailored_resumes)
-                        time.sleep(self.delay)
-                finally:
-                    ctx.close()
-                    browser.close()
-            else:
-                print(f"  [Agent3] No credentials for '{platform}' — skipping.")
+            print(f"  [Agent3] No credentials for '{platform}' — skipping.")
             return
 
         browser: Browser = self._launch_browser(playwright)

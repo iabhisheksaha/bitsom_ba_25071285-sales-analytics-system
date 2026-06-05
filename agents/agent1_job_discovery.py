@@ -106,16 +106,30 @@ def scraperapi_fetch(
     if render:
         params["render"] = "true"
 
-    try:
-        resp = requests.get(SCRAPER_API_ENDPOINT, params=params, timeout=timeout)
-        if resp.status_code != 200:
-            body = (resp.text or "")[:300]
-            print(f"  [Agent1] ScraperAPI HTTP {resp.status_code} for {target_url}\n"
-                  f"           body: {body}")
-        return resp
-    except requests.RequestException as exc:
-        print(f"  [Agent1] ScraperAPI request failed for {target_url}: {exc}")
-        return None
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(SCRAPER_API_ENDPOINT, params=params, timeout=timeout)
+            if resp.status_code < 500:
+                if resp.status_code != 200:
+                    body = (resp.text or "")[:300]
+                    print(f"  [Agent1] ScraperAPI HTTP {resp.status_code} for {target_url}\n"
+                          f"           body: {body}")
+                return resp
+            # 5xx — transient server-side render failure; retry with backoff
+            wait = 10 * (attempt + 1)
+            print(f"  [Agent1] ScraperAPI HTTP {resp.status_code} (attempt {attempt+1}/3) — "
+                  f"retrying in {wait}s…")
+            time.sleep(wait)
+        except requests.RequestException as exc:
+            last_exc = exc
+            wait = 10 * (attempt + 1)
+            print(f"  [Agent1] ScraperAPI request error (attempt {attempt+1}/3): {exc} — "
+                  f"retrying in {wait}s…")
+            time.sleep(wait)
+    print(f"  [Agent1] ScraperAPI all retries exhausted for {target_url}"
+          + (f": {last_exc}" if last_exc else ""))
+    return None
 
 
 def _debug_dump_html(platform: str, html: str, page_no: int = 1) -> None:
