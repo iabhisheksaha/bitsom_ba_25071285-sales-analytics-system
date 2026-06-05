@@ -38,6 +38,38 @@ _ATS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NAUKRI_LOGIN_URL = "https://www.naukri.com/central-login-services/v2/login"
+
+
+def _naukri_login(username: str, password: str) -> "Optional[requests.Session]":
+    """POST to Naukri login API; return an authenticated session or None."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":       "application/json",
+        "Content-Type": "application/json",
+        "Referer":      "https://www.naukri.com/",
+        "appId":        "105",
+        "systemId":     "105",
+    })
+    try:
+        resp = session.post(
+            _NAUKRI_LOGIN_URL,
+            json={"username": username, "password": password},
+            timeout=30,
+        )
+        if resp.ok:
+            print(f"  [Agent3/Naukri] Login OK (HTTP {resp.status_code})")
+            return session
+        print(f"  [Agent3/Naukri] Login failed: HTTP {resp.status_code} — {resp.text[:200]}")
+        return None
+    except requests.RequestException as exc:
+        print(f"  [Agent3/Naukri] Login request error: {exc}")
+        return None
+
 
 def _naukri_find_apply_link(obj, depth: int = 0) -> "str | None":
     """Recursively search a JSON object for an external ATS apply URL."""
@@ -764,6 +796,8 @@ class ApplicationAgent:
         self.delay = self.app_config.get("delay_between_apps", 30)
         self.captcha_timeout = self.app_config.get("captcha_timeout", 300)
         self.creds_request_timeout = self.app_config.get("creds_request_timeout", 600)
+        self._naukri_auth_session: Optional[requests.Session] = None
+        self._naukri_session_tried: bool = False
 
         tg_cfg = config.get("telegram", {})
         bot_token = os.environ.get(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"), "")
@@ -809,6 +843,20 @@ class ApplicationAgent:
         except ImportError:
             pass
         return ctx, page
+
+    def _get_naukri_session(self) -> "Optional[requests.Session]":
+        """Lazily authenticate with Naukri; cache session for the run."""
+        if self._naukri_session_tried:
+            return self._naukri_auth_session
+        self._naukri_session_tried = True
+        try:
+            creds = self.cred_manager.get_site_credentials("naukri", self.cred_key)
+            self._naukri_auth_session = _naukri_login(
+                creds.get("username", ""), creds.get("password", "")
+            )
+        except (KeyError, FileNotFoundError) as exc:
+            print(f"  [Agent3/Naukri] Could not load Naukri credentials: {exc}")
+        return self._naukri_auth_session
 
     def run(self, jobs: list[JobPosting], tailored_resumes: dict[str, Path]) -> None:
         print(f"[Agent3] Starting application run for {len(jobs)} jobs")
@@ -1029,13 +1077,23 @@ class ApplicationAgent:
             ext_url = job.apply_url
             print(f"  [Agent3/Naukri] Using pre-fetched apply_url: {ext_url[:80]}")
 
-        # ── 2. Naukri job detail API (free, no credits) ───────────────────
+        # ── 2. Naukri job detail API (unauthenticated, free) ─────────────
         if not ext_url and job.job_id:
             ext_url = self._naukri_api_apply_url(job.job_id)
             if ext_url:
                 print(f"  [Agent3/Naukri] Apply URL from job API (jobId={job.job_id}): {ext_url[:80]}")
             else:
-                print(f"  [Agent3/Naukri] Job API: no ATS URL for jobId={job.job_id}")
+                print(f"  [Agent3/Naukri] Job API (unauth): no ATS URL for jobId={job.job_id}")
+
+        # ── 2.5. Authenticated Naukri API (unlocks applyRedirectUrl) ─────
+        if not ext_url and job.job_id:
+            auth_session = self._get_naukri_session()
+            if auth_session:
+                ext_url = self._naukri_api_apply_url(job.job_id, session=auth_session)
+                if ext_url:
+                    print(f"  [Agent3/Naukri] Apply URL from auth API: {ext_url[:80]}")
+                else:
+                    print(f"  [Agent3/Naukri] Job API (auth): no ATS URL for jobId={job.job_id}")
 
         # ── 3. ScraperAPI render scan (optional, credit-consuming) ────────
         if not ext_url:
@@ -1106,7 +1164,8 @@ class ApplicationAgent:
             print(f"  [Agent3/Naukri] ATS navigate error for {job.company}: {exc}")
             self.log.record(job, "failed", str(exc)[:100])
 
-    def _naukri_api_apply_url(self, job_id: str) -> str:
+    def _naukri_api_apply_url(self, job_id: str,
+                              session: "Optional[requests.Session]" = None) -> str:
         """Call Naukri's job detail JSON API to get the external apply URL (free)."""
         _HEADERS = {
             "system-id":  "109",
@@ -1118,9 +1177,11 @@ class ApplicationAgent:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
+            "Referer":    "https://www.naukri.com/",
         }
+        requester = session or requests.Session()
         try:
-            resp = requests.get(
+            resp = requester.get(
                 "https://www.naukri.com/jobapi/v3/job",
                 params={"jobId": job_id},
                 headers=_HEADERS,
@@ -1129,19 +1190,10 @@ class ApplicationAgent:
             if not resp.ok:
                 return ""
             data = resp.json()
-            for key in (
-                "applyRedirectUrl", "externalApplyLink", "applyLink",
-                "redirectLink", "companyCareerLink", "applyUrl",
-                "externalApplyUrl", "extApplyUrl", "externalUrl", "careerPageUrl",
-            ):
-                val = data.get(key, "")
-                if isinstance(val, str) and val.startswith("http"):
-                    if any(d in val for d in _ATS_DOMAINS_TUPLE):
-                        return val
-            for v in data.values():
-                if isinstance(v, str) and v.startswith("http"):
-                    if any(d in v for d in _ATS_DOMAINS_TUPLE):
-                        return v
+            # Recursive search handles deeply nested ATS URLs
+            found = _naukri_find_apply_link(data)
+            if found:
+                return found
         except Exception as exc:
             print(f"  [Agent3/Naukri] Job API error (jobId={job_id}): {exc}")
         return ""
