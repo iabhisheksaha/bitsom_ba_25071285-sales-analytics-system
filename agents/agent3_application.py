@@ -7,6 +7,7 @@ Uses Playwright for browser automation.
 
 import json
 import os
+import re
 import smtplib
 import time
 from datetime import date, datetime
@@ -20,6 +21,28 @@ from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as 
 
 from agents.agent1_job_discovery import JobPosting
 from agents.agent4_credentials import CredentialManager
+
+
+def _naukri_find_apply_link(obj, depth: int = 0) -> "str | None":
+    """Recursively search Naukri's __NEXT_DATA__ JSON for an external apply URL."""
+    if depth > 8:
+        return None
+    if isinstance(obj, dict):
+        for key in ("applyLink", "externalApplyLink", "companyCareerLink",
+                    "redirectLink", "applyUrl", "externalApplyUrl"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+        for v in obj.values():
+            found = _naukri_find_apply_link(v, depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _naukri_find_apply_link(v, depth + 1)
+            if found:
+                return found
+    return None
 
 CHROMIUM_BIN = os.environ.get(
     "CHROMIUM_BIN",
@@ -802,10 +825,14 @@ class ApplicationAgent:
             print(f"  [Agent3] {platform}: using direct-URL apply (follow job link → company ATS).")
             browser: Browser = self._launch_browser(playwright)
             ctx, page = self._new_stealth_page(browser)
+            # Use a shorter delay for direct-URL applies — each job triggers a
+            # ScraperAPI render call rather than an interactive browser session,
+            # so the heavy 30s rate-limit delay is unnecessary here.
+            direct_delay = max(5, self.delay // 6)
             try:
                 for job in jobs:
                     self._apply_via_job_url(page, job, tailored_resumes)
-                    time.sleep(self.delay)
+                    time.sleep(direct_delay)
             finally:
                 ctx.close()
                 browser.close()
@@ -874,8 +901,16 @@ class ApplicationAgent:
 
     def _apply_via_job_url(self, page: Page, job: "JobPosting", tailored_resumes: dict) -> None:
         """
-        Navigate directly to job.url (e.g. an Indeed tracking link) and attempt
-        to follow through to the company's external ATS page.
+        Apply to a job by following its URL to the company's external ATS.
+
+        For Naukri: proxy-mode Playwright gets empty shells (Akamai CDN).
+          → Use ScraperAPI render API to fetch the rendered job page, extract
+            the external apply link from HTML/JSON, then navigate Playwright
+            directly to the ATS URL (Workday/Greenhouse/Lever etc. are not
+            Akamai-protected, so Playwright works fine there).
+
+        For Indeed / other platforms: use Playwright directly (the job URL
+          redirects to the ATS with a normal navigation flow).
         """
         key = f"{job.platform}::{job.company}::{job.title}"
 
@@ -895,18 +930,22 @@ class ApplicationAgent:
 
         print(f"  [Agent3] Direct-apply → {job.company} | {job.title}")
 
+        # ── Naukri: render-API approach ────────────────────────────────────
+        if job.platform == "naukri":
+            self._apply_naukri_via_render(page, job, resume_path)
+            return
+
+        # ── All other platforms: Playwright navigation approach ────────────
         try:
             page.goto(job.url, timeout=30000, wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
             current_url = page.url
 
-            # Already redirected to a known ATS
             ats = detect_ats(current_url)
             if ats:
                 self._handle_external_apply(page, job, resume_path, current_url)
                 return
 
-            # Look for "Apply on company site" / external apply button
             apply_link = (
                 page.query_selector("a[data-testid='viewJobButtonLinkComponent']") or
                 page.query_selector("a[href*='applyRedirect']") or
@@ -920,7 +959,6 @@ class ApplicationAgent:
                 self.log.record(job, "skipped", "no external apply link")
                 return
 
-            # Follow the link — may open popup or navigate in-place
             try:
                 with page.context.expect_page(timeout=8000) as popup_info:
                     apply_link.click()
@@ -943,6 +981,84 @@ class ApplicationAgent:
 
         except Exception as exc:
             print(f"  [Agent3] Direct-apply error for {job.company}: {exc}")
+            self.log.record(job, "failed", str(exc)[:100])
+
+    def _apply_naukri_via_render(self, page: Page, job: "JobPosting", resume_path: Path) -> None:
+        """
+        Fetch the Naukri job detail page via ScraperAPI render API (bypasses
+        Akamai fingerprinting), extract the external apply URL from the
+        rendered HTML / __NEXT_DATA__, then navigate Playwright to that URL.
+        """
+        import json as _json
+        from bs4 import BeautifulSoup as _BS
+        from agents.agent1_job_discovery import scraperapi_fetch
+
+        resp = scraperapi_fetch(job.url, render=True, country="in")
+        if resp is None or resp.status_code != 200:
+            print(f"  [Agent3/Naukri] Render-fetch failed for {job.company} — skipping.")
+            self.log.record(job, "skipped", "naukri render-fetch failed")
+            return
+
+        html = resp.text
+        soup = _BS(html, "html.parser")
+
+        # ── 1. Try __NEXT_DATA__ for machine-readable apply link ──────────
+        ext_url = None
+        script = soup.find("script", id="__NEXT_DATA__")
+        if script and script.string:
+            try:
+                data = _json.loads(script.string)
+                ext_url = _naukri_find_apply_link(data)
+                if ext_url:
+                    print(f"  [Agent3/Naukri] Got apply link from __NEXT_DATA__: {ext_url[:70]}")
+            except Exception as exc:
+                print(f"  [Agent3/Naukri] __NEXT_DATA__ parse error: {exc}")
+
+        # ── 2. HTML selectors (rendered page, full DOM available) ─────────
+        if not ext_url:
+            for sel in [
+                "a.extApply",
+                "a[class*='extApply']",
+                "a[class*='ext-apply']",
+                "a[class*='company-site']",
+                "a[href*='applyRedirect']",
+                "a[href*='apply_redirect']",
+                "a[href*='/job-apply/']",
+                "button[class*='extApply']",
+            ]:
+                el = soup.select_one(sel)
+                if el and el.get("href"):
+                    ext_url = el["href"]
+                    print(f"  [Agent3/Naukri] Got apply link via selector '{sel}': {ext_url[:70]}")
+                    break
+
+        # ── 3. Debug dump when nothing found ──────────────────────────────
+        if not ext_url:
+            debug_dir = Path("logs/debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            slug = re.sub(r"[^a-z0-9]+", "_", job.company.lower())[:30]
+            out = debug_dir / f"naukri_job_{slug}.html"
+            try:
+                out.write_text(html, encoding="utf-8")
+                print(f"  [Agent3/Naukri] No apply link found — debug dump → {out} "
+                      f"({len(html)} chars). Snippet: {html[:400]}")
+            except Exception:
+                pass
+            self.log.record(job, "skipped", "naukri: no ext apply link in rendered page")
+            return
+
+        # ── 4. ATS detected? Navigate Playwright there ────────────────────
+        ats = detect_ats(ext_url)
+        if not ats:
+            print(f"  [Agent3/Naukri] Apply link is not a known ATS: {ext_url[:70]}")
+            self.log.record(job, "skipped", f"naukri ext link unsupported ATS: {ext_url[:60]}")
+            return
+
+        try:
+            page.goto(ext_url, timeout=30000, wait_until="domcontentloaded")
+            self._handle_external_apply(page, job, resume_path, ext_url)
+        except Exception as exc:
+            print(f"  [Agent3/Naukri] ATS navigate error for {job.company}: {exc}")
             self.log.record(job, "failed", str(exc)[:100])
 
     def _handle_external_apply(self, page: Page, job: "JobPosting",
