@@ -45,7 +45,18 @@ _CHROMIUM_BIN = os.environ.get(
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
 )
 
-def _launch_scraper_browser(pw, use_proxy: bool = True, ultra_premium: bool = False):
+def _launch_scraper_browser(pw, use_proxy: bool = True, country: str = "in"):
+    """
+    Launch a Playwright Chromium browser.
+
+    country: ISO-2 country code passed to ScraperAPI as country_code=XX.
+             Defaults to "in" (Indian residential IP) which works on all plans
+             and is optimal for in.indeed.com / naukri.com.
+             Pass "" to use ScraperAPI's default (any country).
+
+    A random session_number is appended so each pipeline run gets a fresh IP,
+    preventing the "multiple users from same IP" block on Indeed.
+    """
     chromium_bin = _CHROMIUM_BIN if Path(_CHROMIUM_BIN).exists() else None
     launch_kwargs = dict(
         headless=True,
@@ -55,16 +66,19 @@ def _launch_scraper_browser(pw, use_proxy: bool = True, ultra_premium: bool = Fa
     if chromium_bin:
         launch_kwargs["executable_path"] = chromium_bin
     if use_proxy and SCRAPER_API_KEY:
-        # ultra_premium uses the highest-quality residential IPs with per-request
-        # rotation — needed for Indeed/LinkedIn which detect shared IPs.
-        proxy_user = "scraperapi.ultra_premium=true" if ultra_premium else "scraperapi"
+        parts = ["scraperapi"]
+        if country:
+            parts.append(f"country_code={country}")
+        # Random session number forces ScraperAPI to assign a fresh residential IP
+        # on every pipeline run, avoiding repeated-IP bans on Indeed/Naukri.
+        parts.append(f"session_number={random.randint(10000, 99999)}")
+        proxy_user = ".".join(parts)
         launch_kwargs["proxy"] = {
             "server":   "http://proxy-server.scraperapi.com:8001",
             "username": proxy_user,
             "password": SCRAPER_API_KEY,
         }
-        tier = "ultra_premium" if ultra_premium else "standard"
-        print(f"  [Agent1] ScraperAPI proxy active ({tier})")
+        print(f"  [Agent1] ScraperAPI proxy active (country={country or 'any'}, fresh IP per run)")
     return pw.chromium.launch(**launch_kwargs)
 
 
@@ -658,16 +672,15 @@ class JobDiscoveryAgent:
 
         all_postings: list[JobPosting] = []
 
-        # ── Naukri — ScraperAPI standard proxy ────────────────────────────
-        # Direct GitHub Actions IPs are Akamai-blocked; standard ScraperAPI
-        # at least reaches Naukri's servers (partial content), ultra_premium
-        # may eventually break through fully.
+        # ── Naukri — ScraperAPI with Indian residential IP ────────────────
+        # Naukri (and in.indeed.com) geo-restrict or rate-limit non-Indian IPs.
+        # country_code=in is available on all ScraperAPI plans (no upgrade needed).
         if platforms.get("naukri", True):
             try:
                 from playwright.sync_api import sync_playwright
-                print("  [Agent1] Launching Playwright browser for Naukri (ScraperAPI standard)…")
+                print("  [Agent1] Launching Playwright browser for Naukri (country=in)…")
                 with sync_playwright() as pw:
-                    browser = _launch_scraper_browser(pw, use_proxy=True, ultra_premium=False)
+                    browser = _launch_scraper_browser(pw, use_proxy=True, country="in")
                     try:
                         jobs = NaukriScraper(self.config, browser).scrape(roles, seniority, location)
                         print(f"  [Agent1] NaukriScraper found {len(jobs)} postings")
@@ -679,30 +692,40 @@ class JobDiscoveryAgent:
                 print(f"  [Agent1] Naukri Playwright error: {exc}")
                 traceback.print_exc()
 
-        # ── Indeed + LinkedIn — ScraperAPI ultra_premium ──────────────────
-        # Indeed and LinkedIn detect shared/repeated IPs. ultra_premium rotates
-        # a fresh residential IP on each request, bypassing "multiple users" errors.
-        needs_proxy_pw = platforms.get("indeed", True) or platforms.get("linkedin", True)
-        if needs_proxy_pw:
+        # ── Indeed — ScraperAPI with Indian residential IP ────────────────
+        if platforms.get("indeed", True):
             try:
                 from playwright.sync_api import sync_playwright
-                print("  [Agent1] Launching Playwright browser for Indeed/LinkedIn (ultra_premium)…")
+                print("  [Agent1] Launching Playwright browser for Indeed (country=in)…")
                 with sync_playwright() as pw:
-                    browser = _launch_scraper_browser(pw, use_proxy=True, ultra_premium=True)
+                    browser = _launch_scraper_browser(pw, use_proxy=True, country="in")
                     try:
-                        if platforms.get("indeed", True):
-                            jobs = IndeedScraper(self.config, browser).scrape(roles, seniority, location)
-                            print(f"  [Agent1] IndeedScraper found {len(jobs)} postings")
-                            all_postings.extend(jobs)
-                        if platforms.get("linkedin", True):
-                            jobs = LinkedInScraper(self.config, browser).scrape(roles, seniority, location)
-                            print(f"  [Agent1] LinkedInScraper found {len(jobs)} postings")
-                            all_postings.extend(jobs)
+                        jobs = IndeedScraper(self.config, browser).scrape(roles, seniority, location)
+                        print(f"  [Agent1] IndeedScraper found {len(jobs)} postings")
+                        all_postings.extend(jobs)
                     finally:
                         browser.close()
             except Exception as exc:
                 import traceback
-                print(f"  [Agent1] Indeed/LinkedIn Playwright error: {exc}")
+                print(f"  [Agent1] Indeed Playwright error: {exc}")
+                traceback.print_exc()
+
+        # ── LinkedIn — ScraperAPI with any country IP ─────────────────────
+        if platforms.get("linkedin", True):
+            try:
+                from playwright.sync_api import sync_playwright
+                print("  [Agent1] Launching Playwright browser for LinkedIn (country=any)…")
+                with sync_playwright() as pw:
+                    browser = _launch_scraper_browser(pw, use_proxy=True, country="")
+                    try:
+                        jobs = LinkedInScraper(self.config, browser).scrape(roles, seniority, location)
+                        print(f"  [Agent1] LinkedInScraper found {len(jobs)} postings")
+                        all_postings.extend(jobs)
+                    finally:
+                        browser.close()
+            except Exception as exc:
+                import traceback
+                print(f"  [Agent1] LinkedIn Playwright error: {exc}")
                 traceback.print_exc()
 
         unique = self._deduplicate(all_postings)
