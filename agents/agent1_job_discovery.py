@@ -213,7 +213,7 @@ class NaukriScraper(BaseScraper):
                 timeout=20,
             )
             if not resp.ok:
-                print(f"  [Agent1/Naukri] API HTTP {resp.status_code}")
+                print(f"  [Agent1/Naukri] API HTTP {resp.status_code} — {resp.text[:300]}")
                 return []
             data = resp.json()
             job_list = data.get("jobDetails") or data.get("jobs") or []

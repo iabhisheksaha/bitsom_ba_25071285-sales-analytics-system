@@ -818,13 +818,8 @@ class ApplicationAgent:
         )
         if chromium_bin:
             launch_kwargs["executable_path"] = chromium_bin
-        if SCRAPER_API_KEY:
-            launch_kwargs["proxy"] = {
-                "server": "http://proxy-server.scraperapi.com:8001",
-                "username": "scraperapi",
-                "password": SCRAPER_API_KEY,
-            }
-            print("  [Agent3] ScraperAPI proxy active for browser sessions")
+        # No proxy: ATS sites (LinkedIn, Workday, Greenhouse, Lever) don't need
+        # one, and routing through ScraperAPI burns credits on every page load.
         return playwright.chromium.launch(**launch_kwargs)
 
     def _new_stealth_page(self, browser: Browser) -> tuple:
@@ -925,7 +920,10 @@ class ApplicationAgent:
         try:
             logged_in = handler.login(creds.get("username", ""), creds.get("password", ""))
             if not logged_in:
-                print(f"  [Agent3] Login failed for {platform} — skipping platform.")
+                print(f"  [Agent3] Login failed for {platform} — falling back to direct-URL apply.")
+                for job in jobs:
+                    self._apply_via_job_url(page, job, tailored_resumes)
+                    time.sleep(max(5, self.delay // 6))
                 return
 
             for job in jobs:
