@@ -23,20 +23,46 @@ from agents.agent1_job_discovery import JobPosting
 from agents.agent4_credentials import CredentialManager
 
 
+_ATS_DOMAINS_TUPLE = (
+    "workday.com", "myworkdayjobs.com", "greenhouse.io", "lever.co",
+    "icims.com", "taleo.net", "smartrecruiters.com", "successfactors",
+    "bamboohr.com", "jobvite.com", "ashbyhq.com",
+)
+
+_ATS_URL_RE = re.compile(
+    r'https?://[^\s"\'<>]*(?:'
+    r'workday\.com|myworkdayjobs\.com|greenhouse\.io|'
+    r'lever\.co|icims\.com|taleo\.net|smartrecruiters\.com|'
+    r'successfactors|bamboohr\.com|jobvite\.com|ashbyhq\.com'
+    r')[^\s"\'<>]*',
+    re.IGNORECASE,
+)
+
+
 def _naukri_find_apply_link(obj, depth: int = 0) -> "str | None":
-    """Recursively search Naukri's __NEXT_DATA__ JSON for an external apply URL."""
-    if depth > 8:
+    """Recursively search Naukri's __NEXT_DATA__ JSON for an external ATS URL."""
+    if depth > 12:
         return None
     if isinstance(obj, dict):
-        for key in ("applyLink", "externalApplyLink", "companyCareerLink",
-                    "redirectLink", "applyUrl", "externalApplyUrl"):
+        for key in (
+            "applyLink", "externalApplyLink", "companyCareerLink",
+            "redirectLink", "applyUrl", "externalApplyUrl",
+            "applyRedirectUrl", "redirectUrl", "extApplyUrl",
+            "companyUrl", "externalUrl", "jobApplyUrl",
+            "careerPageUrl", "externalJobUrl", "atsUrl",
+        ):
             val = obj.get(key)
             if isinstance(val, str) and val.startswith("http"):
-                return val
+                if any(d in val for d in _ATS_DOMAINS_TUPLE):
+                    return val
         for v in obj.values():
-            found = _naukri_find_apply_link(v, depth + 1)
-            if found:
-                return found
+            if isinstance(v, str) and v.startswith("http"):
+                if any(d in v for d in _ATS_DOMAINS_TUPLE):
+                    return v
+            elif isinstance(v, (dict, list)):
+                found = _naukri_find_apply_link(v, depth + 1)
+                if found:
+                    return found
     elif isinstance(obj, list):
         for v in obj:
             found = _naukri_find_apply_link(v, depth + 1)
@@ -988,6 +1014,13 @@ class ApplicationAgent:
         Fetch the Naukri job detail page via ScraperAPI render API (bypasses
         Akamai fingerprinting), extract the external apply URL from the
         rendered HTML / __NEXT_DATA__, then navigate Playwright to that URL.
+
+        Strategy (in priority order):
+          1. Regex scan of raw HTML for any known ATS URL pattern — most reliable,
+             works regardless of CSS class names or JSON key names.
+          2. __NEXT_DATA__ recursive search for ATS-domain strings.
+          3. BeautifulSoup scan of all <a> tags for ATS-matching hrefs.
+          4. Debug dump + skip when all approaches fail.
         """
         import json as _json
         from bs4 import BeautifulSoup as _BS
@@ -995,44 +1028,48 @@ class ApplicationAgent:
 
         resp = scraperapi_fetch(job.url, render=True, country="in")
         if resp is None or resp.status_code != 200:
-            print(f"  [Agent3/Naukri] Render-fetch failed for {job.company} — skipping.")
+            code = resp.status_code if resp else "none"
+            print(f"  [Agent3/Naukri] Render-fetch failed (HTTP {code}) for {job.company}.")
             self.log.record(job, "skipped", "naukri render-fetch failed")
             return
 
         html = resp.text
         soup = _BS(html, "html.parser")
-
-        # ── 1. Try __NEXT_DATA__ for machine-readable apply link ──────────
         ext_url = None
-        script = soup.find("script", id="__NEXT_DATA__")
-        if script and script.string:
-            try:
-                data = _json.loads(script.string)
-                ext_url = _naukri_find_apply_link(data)
-                if ext_url:
-                    print(f"  [Agent3/Naukri] Got apply link from __NEXT_DATA__: {ext_url[:70]}")
-            except Exception as exc:
-                print(f"  [Agent3/Naukri] __NEXT_DATA__ parse error: {exc}")
 
-        # ── 2. HTML selectors (rendered page, full DOM available) ─────────
+        # ── 1. Regex scan of full raw HTML for ATS URLs ───────────────────
+        # Catches URLs in JSON strings, data-* attrs, script vars — anywhere.
+        matches = _ATS_URL_RE.findall(html)
+        if matches:
+            ext_url = matches[0].rstrip(".,;)")
+            print(f"  [Agent3/Naukri] ATS URL found via regex: {ext_url[:80]}")
+
+        # ── 2. __NEXT_DATA__ recursive ATS search ─────────────────────────
         if not ext_url:
-            for sel in [
-                "a.extApply",
-                "a[class*='extApply']",
-                "a[class*='ext-apply']",
-                "a[class*='company-site']",
-                "a[href*='applyRedirect']",
-                "a[href*='apply_redirect']",
-                "a[href*='/job-apply/']",
-                "button[class*='extApply']",
-            ]:
-                el = soup.select_one(sel)
-                if el and el.get("href"):
-                    ext_url = el["href"]
-                    print(f"  [Agent3/Naukri] Got apply link via selector '{sel}': {ext_url[:70]}")
+            script = soup.find("script", id="__NEXT_DATA__")
+            if script and script.string:
+                try:
+                    data = _json.loads(script.string)
+                    ext_url = _naukri_find_apply_link(data)
+                    if ext_url:
+                        print(f"  [Agent3/Naukri] ATS URL from __NEXT_DATA__: {ext_url[:80]}")
+                    else:
+                        print(f"  [Agent3/Naukri] __NEXT_DATA__ parsed ({len(script.string)} chars) but no ATS URL.")
+                except Exception as exc:
+                    print(f"  [Agent3/Naukri] __NEXT_DATA__ parse error: {exc}")
+            else:
+                print(f"  [Agent3/Naukri] __NEXT_DATA__ script tag not found in {len(html)}-char page.")
+
+        # ── 3. Scan all <a> tags for ATS-matching hrefs ───────────────────
+        if not ext_url:
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if detect_ats(href):
+                    ext_url = href
+                    print(f"  [Agent3/Naukri] ATS href found in <a>: {ext_url[:80]}")
                     break
 
-        # ── 3. Debug dump when nothing found ──────────────────────────────
+        # ── 4. Debug dump when nothing found ──────────────────────────────
         if not ext_url:
             debug_dir = Path("logs/debug")
             debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1040,17 +1077,30 @@ class ApplicationAgent:
             out = debug_dir / f"naukri_job_{slug}.html"
             try:
                 out.write_text(html, encoding="utf-8")
-                print(f"  [Agent3/Naukri] No apply link found — debug dump → {out} "
-                      f"({len(html)} chars). Snippet: {html[:400]}")
+                # Log apply-related anchors to diagnose missing selectors
+                apply_links = [
+                    (a.get_text(strip=True)[:40], a.get("href", "")[:80])
+                    for a in soup.find_all("a", href=True)
+                    if any(x in (a.get("class") or []) or x in (a.get("href") or "")
+                           for x in ("apply", "Apply", "career", "redirect"))
+                ][:10]
+                ext_hrefs = [
+                    (a.get_text(strip=True)[:30], a["href"][:80])
+                    for a in soup.find_all("a", href=True)
+                    if a["href"].startswith("http") and "naukri.com" not in a["href"]
+                ][:10]
+                print(f"  [Agent3/Naukri] No ATS URL — dump → {out} ({len(html)} chars).")
+                print(f"    apply-related links: {apply_links}")
+                print(f"    external hrefs:      {ext_hrefs}")
             except Exception:
                 pass
             self.log.record(job, "skipped", "naukri: no ext apply link in rendered page")
             return
 
-        # ── 4. ATS detected? Navigate Playwright there ────────────────────
+        # ── 5. Navigate Playwright to ATS URL ────────────────────────────
         ats = detect_ats(ext_url)
         if not ats:
-            print(f"  [Agent3/Naukri] Apply link is not a known ATS: {ext_url[:70]}")
+            print(f"  [Agent3/Naukri] URL not a known ATS: {ext_url[:80]}")
             self.log.record(job, "skipped", f"naukri ext link unsupported ATS: {ext_url[:60]}")
             return
 
