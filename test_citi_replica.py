@@ -35,6 +35,7 @@ PORT = 18094
 STATE = {
     "cookie_dismissed": False, "signed_in": False, "account_created": False,
     "submitted": False, "beecatcher": "", "step": 0, "untrusted_attempts": 0,
+    "chose_manual": False, "chose_linkedin": False,
 }
 
 # An invisible full-screen overlay that intercepts pointer events - this is what
@@ -46,20 +47,15 @@ INTERCEPT_OVERLAY = (
 )
 
 
-def page_landing():
+# Landing == Citi's /apply page when signed out: cookie banner + sign-in modal
+# (both forms) + honeypot + the click-intercepting overlay on top. login() signs
+# in here, exactly like the real flow, then the chooser appears.
+def page_signin():
     return f"""<html><body>
-      <div id="cookie" style="position:fixed;top:0;left:0;right:0;z-index:5;background:#eee;padding:8px;">
+      <div id="cookie" style="position:fixed;top:0;left:0;right:0;z-index:10001;background:#eee;padding:8px;">
         Cookies. <button data-automation-id="legalNoticeAcceptButton"
           onclick="fetch('/ev?cookie=1');document.getElementById('cookie').remove()">Accept Cookies</button>
       </div>
-      <h1>Technology Lead Business Analyst - Vice President</h1>
-      <a role="button" data-uxi-element-id="Apply_adventureButton" href="/signin">Apply</a>
-    </body></html>"""
-
-
-# Sign-in modal: both forms + honeypot + the click-intercepting overlay on top.
-def page_signin():
-    return f"""<html><body>
       <h2>Create Account/Sign In</h2>
       <div class="modal" style="position:relative;z-index:10;">
         <h3>Sign In</h3>
@@ -74,7 +70,7 @@ def page_signin():
           <!-- ANTI-BOT: only a TRUSTED click authenticates. A JS .click()
                (event.isTrusted=false) is ignored, exactly like real Citi. -->
           <button type="button" data-automation-id="signInSubmitButton"
-            onclick="if(event.isTrusted){{fetch('/ev?signin=1').then(()=>window.location='/wizard')}}else{{fetch('/ev?untrusted=1')}}">Sign In</button>
+            onclick="if(event.isTrusted){{fetch('/ev?signin=1').then(()=>window.location='/chooser')}}else{{fetch('/ev?untrusted=1')}}">Sign In</button>
         </form>
         <h3>Create Account</h3>
         <form>
@@ -92,6 +88,21 @@ def page_signin():
           fetch('/ev?bee='+encodeURIComponent(e.target.value));
         }});
       </script>
+    </body></html>"""
+
+
+# Post-sign-in 'Start Your Application' chooser. 'Apply With LinkedIn' is a
+# DEAD END (mirrors the real run where it didn't progress); only 'Apply Manually'
+# advances into the wizard. Proves the bot picks the working path.
+def page_chooser():
+    return """<html><body>
+      <h2>Start Your Application</h2>
+      <button data-automation-id="autofillWithResume"
+        onclick="window.location='/wizard'">Autofill with Resume</button>
+      <button data-automation-id="applyManually"
+        onclick="fetch('/ev?manual=1').then(()=>window.location='/wizard')">Apply Manually</button>
+      <button data-automation-id="applyWithLinkedIn"
+        onclick="fetch('/ev?linkedin=1')">Apply With LinkedIn</button>
     </body></html>"""
 
 
@@ -148,16 +159,21 @@ class Mock(BaseHTTPRequestHandler):
             if "create=1" in q: STATE["account_created"] = True
             if "submit=1" in q: STATE["submitted"] = True
             if "untrusted=1" in q: STATE["untrusted_attempts"] += 1
+            if "manual=1" in q: STATE["chose_manual"] = True
+            if "linkedin=1" in q: STATE["chose_linkedin"] = True
             if "bee=" in q: STATE["beecatcher"] = q.split("bee=", 1)[1]
             self._send("ok"); return
         if p == "/signin":
             self._send(page_signin()); return
+        if p == "/chooser":
+            self._send(page_chooser()); return
         if p == "/wizard":
             html = page_wizard(STATE["step"]); STATE["step"] += 1
             self._send(html); return
         if p == "/done":
             self._send("<html><body><h1>Application submitted</h1></body></html>"); return
-        self._send(page_landing())
+        # default (/landing) IS the signed-out apply page with the sign-in modal
+        self._send(page_signin())
 
     def log_message(self, *_):
         pass
@@ -198,6 +214,8 @@ def main():
     checks = [
         ("Cookie banner dismissed",          STATE["cookie_dismissed"]),
         ("Signed in via TRUSTED click",       STATE["signed_in"] and not STATE["account_created"]),
+        ("Chose 'Apply Manually' (not the LinkedIn dead-end)",
+                                              STATE["chose_manual"] and not STATE["chose_linkedin"]),
         ("Honeypot 'beecatcher' left empty",  STATE["beecatcher"] == ""),
         ("Reached real Submit",               STATE["submitted"]),
     ]

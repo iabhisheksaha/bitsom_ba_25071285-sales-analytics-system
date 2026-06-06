@@ -1130,25 +1130,40 @@ class WorkdayHandler(BaseApplicationHandler):
             self._robust_click(apply_btn, "Apply")
             self.page.wait_for_timeout(2500)
 
-        # Preferred: 'Apply With LinkedIn' - the persistent profile is already
-        # logged into LinkedIn, so OAuth auto-authorises (at most one 'Allow').
-        if self._try_apply_with_linkedin():
-            return
+        def _chooser_present():
+            return bool(
+                self._visible("[data-automation-id='applyManually']") or
+                self._visible("a:has-text('Apply Manually')") or
+                self._visible("button:has-text('Apply Manually')") or
+                self._visible("[data-automation-id='autofillWithResume']") or
+                self._visible("a:has-text('Autofill with Resume')")
+            )
 
-        # 'Start Your Application' chooser
-        autofill = (
-            self._visible("[data-automation-id='autofillWithResume']") or
-            self._visible("a:has-text('Autofill with Resume')") or
-            self._visible("button:has-text('Autofill with Resume')")
-        )
+        # PRIMARY: 'Apply Manually'. We are already signed in to Citi directly, so
+        # the manual wizard (My Information -> Questions -> Review -> Submit) is the
+        # most reliable path - our form-filler controls every field. This avoids
+        # the LinkedIn OAuth detour that does not always progress.
         apply_manually = (
             self._visible("[data-automation-id='applyManually']") or
             self._visible("a:has-text('Apply Manually')") or
             self._visible("button:has-text('Apply Manually')")
         )
-        if autofill:
+        if apply_manually:
+            print("    [Workday] Choosing 'Apply Manually'.")
+            self._robust_click(apply_manually, "Apply Manually")
+            self.page.wait_for_timeout(2500)
+            if not _chooser_present():
+                return  # advanced into the wizard
+
+        # FALLBACK 1: 'Autofill with Resume' (upload + Workday parse)
+        autofill = (
+            self._visible("[data-automation-id='autofillWithResume']") or
+            self._visible("a:has-text('Autofill with Resume')") or
+            self._visible("button:has-text('Autofill with Resume')")
+        )
+        if autofill and _chooser_present():
             print("    [Workday] Choosing 'Autofill with Resume'.")
-            autofill.click()
+            self._robust_click(autofill, "Autofill with Resume")
             self.page.wait_for_timeout(2000)
             up = self._visible("input[type='file']")
             if up:
@@ -1156,12 +1171,14 @@ class WorkdayHandler(BaseApplicationHandler):
                 self.page.wait_for_timeout(2500)
             cont = self._visible("[data-automation-id='continueButton'], button:has-text('Continue')")
             if cont:
-                cont.click()
+                self._robust_click(cont, "Continue")
                 self.page.wait_for_timeout(2500)
-        elif apply_manually:
-            print("    [Workday] Choosing 'Apply Manually'.")
-            apply_manually.click()
-            self.page.wait_for_timeout(2000)
+            if not _chooser_present():
+                return
+
+        # FALLBACK 2: 'Apply With LinkedIn' - only if the manual paths didn't work
+        if _chooser_present():
+            self._try_apply_with_linkedin()
 
     def _try_apply_with_linkedin(self) -> bool:
         """
