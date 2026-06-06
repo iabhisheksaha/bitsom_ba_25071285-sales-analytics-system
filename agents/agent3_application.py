@@ -1481,11 +1481,30 @@ class WorkdayHandler(BaseApplicationHandler):
             self.page.wait_for_timeout(2000)
             self._dismiss_overlays()
 
+            # If login() already redirected to Candidate Home (/userHome),
+            # navigate back to the job URL so the Apply button is reachable.
+            def _recover_from_candidate_home():
+                url_now = self.page.url.lower()
+                if "userhome" in url_now or "candidatehome" in url_now:
+                    print(f"    [Workday] At Candidate Home — navigating back to job URL.")
+                    self.page.goto(job.url, timeout=40000, wait_until="domcontentloaded")
+                    self.page.wait_for_timeout(3000)
+                    self._dismiss_overlays()
+                    return True
+                return False
+
+            _recover_from_candidate_home()
+
             self._start_application(resume_path)
 
             # If the wizard opens on a Create Account/Sign In step, handle it
             self._wait_for_step_content()
             self._handle_account_step(username, password)
+
+            # Wizard sign-in may also redirect to Candidate Home — recover again.
+            if _recover_from_candidate_home():
+                self._start_application(resume_path)
+                self._wait_for_step_content()
 
             # Citi may show 'You've already applied for this job' after sign-in.
             if self._already_applied():

@@ -70,7 +70,7 @@ def page_signin():
           <!-- ANTI-BOT: only a TRUSTED click authenticates. A JS .click()
                (event.isTrusted=false) is ignored, exactly like real Citi. -->
           <button type="button" data-automation-id="signInSubmitButton"
-            onclick="if(event.isTrusted){{fetch('/ev?signin=1').then(()=>window.location='/chooser')}}else{{fetch('/ev?untrusted=1')}}">Sign In</button>
+            onclick="if(event.isTrusted){{fetch('/ev?signin=1').then(()=>window.location='/userhome')}}else{{fetch('/ev?untrusted=1')}}">Sign In</button>
         </form>
         <h3>Create Account</h3>
         <form>
@@ -172,6 +172,13 @@ class Mock(BaseHTTPRequestHandler):
             self._send("ok"); return
         if p == "/signin":
             self._send(page_signin()); return
+        if p == "/userhome":
+            # Real Citi redirects here after sign-in. Set signed_in flag.
+            STATE["signed_in"] = True
+            self._send("""<html><body>
+              <h1>Welcome, Abhishek Saha</h1>
+              <p>Candidate Home - My Applications</p>
+            </body></html>"""); return
         if p == "/chooser":
             self._send(page_chooser()); return
         if p == "/wizard":
@@ -179,8 +186,13 @@ class Mock(BaseHTTPRequestHandler):
             self._send(html); return
         if p == "/done":
             self._send("<html><body><h1>Application submitted</h1></body></html>"); return
-        # default (/landing) IS the signed-out apply page with the sign-in modal
-        self._send(page_signin())
+        # /landing: show sign-in page when signed out, chooser when signed in.
+        # This mirrors real Citi: job URL → sign-in modal when logged out,
+        # chooser when already authenticated and navigating back to the job.
+        if STATE["signed_in"]:
+            self._send(page_chooser())
+        else:
+            self._send(page_signin())
 
     def log_message(self, *_):
         pass
