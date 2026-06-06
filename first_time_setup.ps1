@@ -35,7 +35,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] pip install failed." -ForegroundColor Red
     exit 1
 }
-playwright install chromium
+python -m playwright install chromium
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] playwright install failed." -ForegroundColor Red
     exit 1
