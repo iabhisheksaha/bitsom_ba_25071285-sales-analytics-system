@@ -95,14 +95,21 @@ def page_signin():
 # DEAD END (mirrors the real run where it didn't progress); only 'Apply Manually'
 # advances into the wizard. Proves the bot picks the working path.
 def page_chooser():
-    return """<html><body>
+    # As hostile as real Citi: a click-intercepting overlay covers the buttons AND
+    # 'Apply Manually' only advances on a TRUSTED event. So a normal click is
+    # intercepted and a JS click is isTrusted=false - only focus+Enter or a trusted
+    # coordinate click gets through. 'Apply With LinkedIn' is a dead end.
+    return f"""<html><body>
       <h2>Start Your Application</h2>
-      <button data-automation-id="autofillWithResume"
-        onclick="window.location='/wizard'">Autofill with Resume</button>
-      <button data-automation-id="applyManually"
-        onclick="fetch('/ev?manual=1').then(()=>window.location='/wizard')">Apply Manually</button>
-      <button data-automation-id="applyWithLinkedIn"
-        onclick="fetch('/ev?linkedin=1')">Apply With LinkedIn</button>
+      <div style="position:relative;z-index:10;">
+        <button data-automation-id="autofillWithResume"
+          onclick="if(event.isTrusted){{window.location='/wizard'}}">Autofill with Resume</button>
+        <button data-automation-id="applyManually"
+          onclick="if(event.isTrusted){{fetch('/ev?manual=1').then(()=>window.location='/wizard')}}">Apply Manually</button>
+        <button data-automation-id="applyWithLinkedIn"
+          onclick="fetch('/ev?linkedin=1')">Apply With LinkedIn</button>
+      </div>
+      {INTERCEPT_OVERLAY}
     </body></html>"""
 
 

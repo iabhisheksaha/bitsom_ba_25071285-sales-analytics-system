@@ -718,20 +718,28 @@ class WorkdayHandler(BaseApplicationHandler):
             pass
         return None
 
-    def _robust_click(self, el, label: str = "") -> bool:
+    def _robust_click(self, el, label: str = "", verify=None) -> bool:
         """
-        Click an element that may be covered by an invisible anti-bot overlay or
-        not yet 'actionable'. Order matters:
-          1. normal click (the correct path when nothing intercepts)
-          2. JS click   - invokes the element's own click handler directly, so it
-                           IGNORES any overlay sitting on top (Citi's
-                           click-outside-catcher). This is the real bypass.
-          3. force click - LAST resort. NOTE: force only skips Playwright's safety
-                           check; the synthetic mouse event still lands on whatever
-                           is topmost at the coordinates, so on an overlay-covered
-                           button it clicks the OVERLAY, not the button. Hence it
-                           must come after the JS click, never before.
-        Returns True if a method plausibly dispatched the click to the element.
+        Click an element that may be covered by an invisible anti-bot overlay,
+        require a TRUSTED event (Citi checks event.isTrusted), or not be
+        'actionable' yet. Tries several strategies in order of trustworthiness.
+
+        If `verify` (a 0-arg callable returning bool) is given, after each strategy
+        we wait briefly and check verify(); we only stop once it passes. This
+        avoids stopping on a 'false success' (focus+Enter / force-click never throw
+        even when they do nothing). Without `verify`, the first non-throwing method
+        wins.
+
+        Strategy order:
+          1. normal click             - correct path when nothing intercepts
+          2. focus + Enter / Space     - TRUSTED keyboard activation; delivered to
+                                         the focused element with NO coordinate
+                                         hit-testing, so an overlay cannot block it
+          3. trusted coordinate click  - neutralise covering overlay, real mouse
+                                         click at the button centre (isTrusted=true)
+          4. JS click                  - fires the handler directly (isTrusted=false,
+                                         ignored by anti-bot handlers but works else)
+          5. force click               - last resort (may hit an overlay)
         """
         if el is None:
             return False
@@ -752,45 +760,48 @@ class WorkdayHandler(BaseApplicationHandler):
                 self.page.wait_for_timeout(200)
         except Exception:
             pass
-        # 1. normal trusted click
-        try:
-            el.click(timeout=2500)
-            return True
-        except Exception:
-            pass
-        # 2. TRUSTED coordinate click: neutralise any overlay covering the button's
-        #    centre (set pointer-events:none on covering nodes), then a real
-        #    page.mouse click at those coords. This yields event.isTrusted=true,
-        #    which anti-bot handlers (Citi) require - a JS .click() is isTrusted=false
-        #    and gets ignored. Defeats the overlay-blocks-trusted / js-not-trusted trap.
-        try:
-            if self._trusted_coordinate_click(el, label):
+
+        def _normal():
+            el.click(timeout=2500); return True
+
+        strategies = [
+            ("normal click",            _normal),
+            ("focus+Enter",             lambda: self._focus_enter_click(el, label)),
+            ("trusted coordinate click", lambda: self._trusted_coordinate_click(el, label)),
+            ("JS click",                lambda: (el.evaluate("b => b.click()"), True)[1]),
+            ("force click",             lambda: (el.click(timeout=2500, force=True), True)[1]),
+        ]
+
+        dispatched_any = False
+        for name, fn in strategies:
+            try:
+                ok = fn()
+            except Exception:
+                ok = False
+            if not ok:
+                continue
+            dispatched_any = True
+            if verify is None:
+                if name not in ("normal click",):
+                    print(f"    [Workday] {label}: used {name}.")
                 return True
-        except Exception:
-            pass
-        # 3. JS click - fires the handler directly (works where isTrusted is not checked)
-        try:
-            el.evaluate("b => b.click()")
-            print(f"    [Workday] {label}: used JS click.")
-            return True
-        except Exception:
-            pass
-        # 4. force click - last resort (may hit an overlay instead of the element)
-        try:
-            el.click(timeout=2500, force=True)
-            print(f"    [Workday] {label}: used force-click (last resort).")
-            return True
-        except Exception:
-            pass
-        try:
-            dis = el.get_attribute("disabled")
-            adis = el.get_attribute("aria-disabled")
-            if dis is not None or adis == "true":
-                print(f"    [Workday] {label} button is disabled "
-                      f"(disabled={dis!r}, aria-disabled={adis!r}).")
-        except Exception:
-            pass
-        return False
+            # verify-driven: did the click actually have the intended effect?
+            self.page.wait_for_timeout(900)
+            try:
+                if verify():
+                    if name not in ("normal click",):
+                        print(f"    [Workday] {label}: succeeded via {name}.")
+                    return True
+            except Exception:
+                pass
+            # else: try the next strategy
+
+        if verify is not None:
+            try:
+                return bool(verify())
+            except Exception:
+                return False
+        return dispatched_any
 
     def _trusted_coordinate_click(self, el, label: str = "") -> bool:
         """
@@ -836,10 +847,40 @@ class WorkdayHandler(BaseApplicationHandler):
             pass
         try:
             self.page.mouse.click(cx, cy)
-            print(f"    [Workday] {label}: used trusted coordinate click.")
             return True
         except Exception:
             return False
+
+    def _focus_enter_click(self, el, label: str = "") -> bool:
+        """
+        Activate a button/link via the keyboard: focus it, then press Enter (and
+        Space as a fallback for <button>). The resulting click is a TRUSTED event
+        delivered to the focused element with no coordinate hit-testing, so an
+        invisible overlay cannot intercept it. Returns True if the keypress was
+        dispatched (caller's verify() decides whether it actually worked).
+        """
+        try:
+            el.focus()
+        except Exception:
+            try:
+                el.evaluate("e => e.focus()")
+            except Exception:
+                return False
+        dispatched = False
+        for key in ("Enter", " "):
+            try:
+                el.press(key)
+                dispatched = True
+                break
+            except Exception:
+                continue
+        if not dispatched:
+            try:
+                self.page.keyboard.press("Enter")
+                dispatched = True
+            except Exception:
+                pass
+        return dispatched
 
     @staticmethod
     def _react_fill(el, value: str) -> bool:
@@ -1120,15 +1161,6 @@ class WorkdayHandler(BaseApplicationHandler):
         Use My Last Application. Pick a path that lands us in the form wizard.
         """
         self._dismiss_overlays()
-        apply_btn = (
-            self._visible("a[role='button'][data-uxi-element-id='Apply_adventureButton']") or
-            self._visible("[data-automation-id='applyButton']") or
-            self._visible("a:has-text('Apply')") or
-            self._visible("button:has-text('Apply')")
-        )
-        if apply_btn:
-            self._robust_click(apply_btn, "Apply")
-            self.page.wait_for_timeout(2500)
 
         def _chooser_present():
             return bool(
@@ -1138,6 +1170,19 @@ class WorkdayHandler(BaseApplicationHandler):
                 self._visible("[data-automation-id='autofillWithResume']") or
                 self._visible("a:has-text('Autofill with Resume')")
             )
+
+        # If the chooser isn't up yet, click the job's 'Apply' button to bring it up.
+        # (Skip when the chooser is already present, so we don't match 'Apply Manually'
+        #  via the generic has-text('Apply') selector.)
+        if not _chooser_present():
+            apply_btn = (
+                self._visible("a[role='button'][data-uxi-element-id='Apply_adventureButton']") or
+                self._visible("[data-automation-id='applyButton']")
+            )
+            if apply_btn:
+                self._robust_click(apply_btn, "Apply",
+                                   verify=lambda: _chooser_present())
+                self.page.wait_for_timeout(1500)
 
         # PRIMARY: 'Apply Manually'. We are already signed in to Citi directly, so
         # the manual wizard (My Information -> Questions -> Review -> Submit) is the
@@ -1150,9 +1195,8 @@ class WorkdayHandler(BaseApplicationHandler):
         )
         if apply_manually:
             print("    [Workday] Choosing 'Apply Manually'.")
-            self._robust_click(apply_manually, "Apply Manually")
-            self.page.wait_for_timeout(2500)
-            if not _chooser_present():
+            if self._robust_click(apply_manually, "Apply Manually",
+                                  verify=lambda: not _chooser_present()):
                 return  # advanced into the wizard
 
         # FALLBACK 1: 'Autofill with Resume' (upload + Workday parse)
@@ -1163,7 +1207,9 @@ class WorkdayHandler(BaseApplicationHandler):
         )
         if autofill and _chooser_present():
             print("    [Workday] Choosing 'Autofill with Resume'.")
-            self._robust_click(autofill, "Autofill with Resume")
+            self._robust_click(autofill, "Autofill with Resume",
+                               verify=lambda: not _chooser_present() or
+                               bool(self._visible("input[type='file']")))
             self.page.wait_for_timeout(2000)
             up = self._visible("input[type='file']")
             if up:
@@ -1171,7 +1217,7 @@ class WorkdayHandler(BaseApplicationHandler):
                 self.page.wait_for_timeout(2500)
             cont = self._visible("[data-automation-id='continueButton'], button:has-text('Continue')")
             if cont:
-                self._robust_click(cont, "Continue")
+                self._robust_click(cont, "Continue", verify=lambda: not _chooser_present())
                 self.page.wait_for_timeout(2500)
             if not _chooser_present():
                 return
@@ -1348,12 +1394,16 @@ class WorkdayHandler(BaseApplicationHandler):
                     return cand
             return None
 
+        def _signed_in():
+            _, _, e = self._find_anywhere(self._EMAIL_SEL)
+            return e is None
+
         for attempt in range(3):
             btn = _find_signin_btn()
             if btn:
-                clicked = self._robust_click(btn, "Sign In")
+                clicked = self._robust_click(btn, "Sign In", verify=_signed_in)
                 print(f"    [Workday] Sign In click attempt {attempt+1}: "
-                      f"{'done' if clicked else 'all click methods failed'}.")
+                      f"{'advanced' if clicked else 'still on sign-in'}.")
             else:
                 try:
                     pw.press("Enter")
