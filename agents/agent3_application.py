@@ -965,18 +965,17 @@ class WorkdayHandler(BaseApplicationHandler):
                     pass
             if not submit:
                 _, _, submit = self._find_anywhere(self._SUBMIT_SEL)
-            # Clicking submit may close the popup (Citi calls window.close()),
-            # which raises TargetClosedError - that close IS the success signal.
-            try:
-                if submit:
-                    submit.click(timeout=4000)
-                else:
+            # The sign-in modal has an invisible click-outside-catcher overlay that
+            # intercepts pointer events, so a normal click times out. _robust_click
+            # falls back to a JS click which bypasses that interception. Clicking may
+            # also close a popup (Citi window.close()) - handled inside _robust_click.
+            if submit:
+                self._robust_click(submit, "Sign In (modal)")
+            else:
+                try:
                     pw.press("Enter")
-            except Exception as exc:
-                if "closed" in str(exc).lower():
-                    print("    [Workday] Sign-in popup closed after submit (expected).")
-                else:
-                    print(f"    [Workday] Submit click note: {str(exc)[:80]}")
+                except Exception:
+                    pass
             self.page.wait_for_timeout(4500)
             try:
                 self.page.wait_for_load_state("domcontentloaded")
@@ -993,11 +992,18 @@ class WorkdayHandler(BaseApplicationHandler):
                     print(f"    [Workday] Sign-in error: {txt}")
                     return False
 
-            # Bring focus back to the main application page (popup usually closes)
             try:
                 self.page.bring_to_front()
             except Exception:
                 pass
+
+            # VERIFY sign-in actually happened: the email field must be gone.
+            # (Previously we optimistically claimed success, leaving the modal open
+            #  and blocking every later click.)
+            _, _, still_email = self._find_anywhere(self._EMAIL_SEL)
+            if still_email:
+                print("    [Workday] Sign-in modal still open after submit - not authenticated.")
+                return False
             print(f"    [Workday] Signed in - main URL: {self.page.url[:70]}")
             return True
         except PWTimeout as exc:
