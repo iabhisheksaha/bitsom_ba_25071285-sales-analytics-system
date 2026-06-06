@@ -706,38 +706,128 @@ _HANDLER_MAP: dict[str, type] = {
 # ---------------------------------------------------------------------------
 
 class WorkdayHandler(BaseApplicationHandler):
-    """Handles *.myworkdayjobs.com / *.workday.com — requires login."""
+    """Handles *.myworkdayjobs.com / *.workday.com - requires a candidate account login."""
+
+    def _visible(self, selector: str):
+        try:
+            el = self.page.query_selector(selector)
+            if el and el.is_visible():
+                return el
+        except Exception:
+            pass
+        return None
 
     def login(self, username: str, password: str) -> bool:
+        """
+        Sign in to the candidate account. Navigating to a Workday /apply URL
+        while unauthenticated redirects to the candidate sign-in page, which
+        may default to the 'Create Account' tab - so click 'Sign In' first.
+        """
         try:
             self.page.wait_for_load_state("domcontentloaded")
-            self.page.wait_for_timeout(2000)
-            sign_in = self.page.query_selector(
-                "[data-automation-id='signInButton'], a:has-text('Sign In'), button:has-text('Sign In')"
+            self.page.wait_for_timeout(2500)
+
+            # If already signed in, the apply wizard / Apply button is shown -> skip login
+            if self._visible("[data-automation-id='applyButton']") or \
+               self._visible("[data-automation-id='bottom-navigation-next-btn']"):
+                print("    [Workday] Candidate account already signed in.")
+                return True
+
+            # Switch to the Sign In tab if the page opened on Create Account
+            sign_in_tab = (
+                self._visible("[data-automation-id='signInLink']") or
+                self._visible("a:has-text('Sign In')") or
+                self._visible("button:has-text('Sign In')")
             )
-            if sign_in:
-                sign_in.click()
-                self.page.wait_for_timeout(2000)
-            email = self.page.query_selector("[data-automation-id='email'], input[type='email']")
-            if email:
-                email.fill(username)
-                nxt = self.page.query_selector("[data-automation-id='nextButton'], button:has-text('Next')")
-                if nxt:
-                    nxt.click()
-                    self.page.wait_for_timeout(1500)
-            pw = self.page.query_selector("[data-automation-id='password'], input[type='password']")
-            if pw:
-                pw.fill(password)
-                ok = self.page.query_selector(
-                    "[data-automation-id='signInSubmitButton'], [data-automation-id='signInButton']"
-                )
-                if ok:
-                    ok.click()
-                    self.page.wait_for_timeout(3000)
+            if sign_in_tab:
+                sign_in_tab.click()
+                self.page.wait_for_timeout(1500)
+
+            email = self._visible("[data-automation-id='email']") or self._visible("input[type='email']")
+            if not email:
+                print("    [Workday] No email field found - cannot sign in.")
+                return False
+            email.fill(username)
+
+            # Some Workday tenants split email/password across a 'Next' step
+            nxt = self._visible("[data-automation-id='nextButton']")
+            if nxt:
+                nxt.click()
+                self.page.wait_for_timeout(1500)
+
+            pw = self._visible("[data-automation-id='password']") or self._visible("input[type='password']")
+            if not pw:
+                print("    [Workday] No password field found - cannot sign in.")
+                return False
+            pw.fill(password)
+
+            submit = (
+                self._visible("[data-automation-id='signInSubmitButton']") or
+                self._visible("button[type='submit']") or
+                self._visible("[data-automation-id='signInButton']")
+            )
+            if submit:
+                submit.click()
+            else:
+                pw.press("Enter")
+            self.page.wait_for_timeout(4000)
+            self.page.wait_for_load_state("domcontentloaded")
+
+            # Check for a sign-in error banner
+            err = self._visible("[data-automation-id='errorMessage'], .css-error, [role='alert']")
+            if err:
+                txt = (err.inner_text() or "").strip()[:120]
+                if "incorrect" in txt.lower() or "invalid" in txt.lower() or "error" in txt.lower():
+                    print(f"    [Workday] Sign-in error: {txt}")
+                    return False
+            print(f"    [Workday] Signed in - URL: {self.page.url[:70]}")
             return True
         except PWTimeout as exc:
             print(f"    [Workday] Login timeout: {exc}")
             return False
+
+    def _start_application(self, resume_path: Path) -> None:
+        """
+        After sign-in Workday shows a job page with an 'Apply' button, then a
+        'Start Your Application' chooser: Autofill with Resume / Apply Manually /
+        Use My Last Application. Pick a path that lands us in the form wizard.
+        """
+        apply_btn = (
+            self._visible("[data-automation-id='applyButton']") or
+            self._visible("a:has-text('Apply')") or
+            self._visible("button:has-text('Apply')")
+        )
+        if apply_btn:
+            apply_btn.click()
+            self.page.wait_for_timeout(2500)
+
+        # 'Start Your Application' chooser
+        autofill = (
+            self._visible("[data-automation-id='autofillWithResume']") or
+            self._visible("a:has-text('Autofill with Resume')") or
+            self._visible("button:has-text('Autofill with Resume')")
+        )
+        apply_manually = (
+            self._visible("[data-automation-id='applyManually']") or
+            self._visible("a:has-text('Apply Manually')") or
+            self._visible("button:has-text('Apply Manually')")
+        )
+        if autofill:
+            print("    [Workday] Choosing 'Autofill with Resume'.")
+            autofill.click()
+            self.page.wait_for_timeout(2000)
+            up = self._visible("input[type='file']")
+            if up:
+                up.set_input_files(str(resume_path.absolute()))
+                self.page.wait_for_timeout(2500)
+            cont = self._visible("[data-automation-id='continueButton'], button:has-text('Continue')")
+            if cont:
+                cont.click()
+                self.page.wait_for_timeout(2500)
+        elif apply_manually:
+            print("    [Workday] Choosing 'Apply Manually'.")
+            apply_manually.click()
+            self.page.wait_for_timeout(2000)
 
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
         profile = _load_applicant_profile()
@@ -746,47 +836,55 @@ class WorkdayHandler(BaseApplicationHandler):
         try:
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2000)
-            apply_btn = self.page.query_selector(
-                "[data-automation-id='applyButton'], button:has-text('Apply')"
-            )
-            if apply_btn:
-                apply_btn.click()
-                self.page.wait_for_timeout(2000)
 
-            for step in range(12):
-                # Upload resume / cover letter file input if visible
-                upload = self.page.query_selector(
-                    "input[type='file']:not([style*='display: none'])"
-                )
-                if upload and upload.is_visible():
-                    upload.set_input_files(str(resume_path.absolute()))
-                    self.page.wait_for_timeout(1000)
+            self._start_application(resume_path)
 
-                # AI-fill all visible form fields on this wizard step
-                fill_page_fields(self.page, profile, resume_text)
-                fill_radio_groups(self.page, profile, resume_text)
-                self.page.wait_for_timeout(500)
+            for step in range(15):
+                # Upload resume on any step that exposes a visible file input
+                upload = self._visible("input[type='file']")
+                if upload:
+                    try:
+                        upload.set_input_files(str(resume_path.absolute()))
+                        self.page.wait_for_timeout(1200)
+                    except Exception:
+                        pass
 
-                done   = self.page.query_selector("[data-automation-id='bottom-navigation-done-btn']")
-                nxt    = self.page.query_selector("[data-automation-id='bottom-navigation-next-btn']")
-                submit = self.page.query_selector(
+                # AI-fill all visible fields on this wizard step
+                filled = fill_page_fields(self.page, profile, resume_text)
+                radios = fill_radio_groups(self.page, profile, resume_text)
+                print(f"    [Workday] Step {step+1}: filled {filled} fields, {radios} radio groups.")
+                self.page.wait_for_timeout(600)
+
+                submit = self._visible(
                     "[data-automation-id='submitButton'], button:has-text('Submit')"
                 )
+                done   = self._visible("[data-automation-id='bottom-navigation-done-btn']")
+                nxt    = (
+                    self._visible("[data-automation-id='bottom-navigation-next-btn']") or
+                    self._visible("[data-automation-id='continueButton']") or
+                    self._visible("button:has-text('Save and Continue')") or
+                    self._visible("button:has-text('Continue')") or
+                    self._visible("button:has-text('Next')")
+                )
 
-                if done and done.is_visible():
+                if submit:
+                    submit.click()
+                    self.page.wait_for_timeout(3000)
+                    print("    [Workday] Submit clicked.")
+                    return True
+                elif done:
                     done.click()
                     self.page.wait_for_timeout(2000)
                     return True
-                elif submit and submit.is_visible():
-                    submit.click()
-                    self.page.wait_for_timeout(2000)
-                    return True
-                elif nxt and nxt.is_visible():
+                elif nxt:
                     nxt.click()
-                    self.page.wait_for_timeout(1500)
+                    self.page.wait_for_timeout(1800)
+                    self.page.wait_for_load_state("domcontentloaded")
                 else:
+                    print(f"    [Workday] No Next/Submit on step {step+1} - stopping.")
                     break
-            return True
+            print("    [Workday] Reached step limit without a Submit button.")
+            return False
         except PWTimeout as exc:
             print(f"    [Workday] Apply timeout: {exc}")
             return False

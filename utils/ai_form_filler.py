@@ -22,8 +22,9 @@ _MODEL = "claude-haiku-4-5-20251001"
 # ---------------------------------------------------------------------------
 
 _PRESET_PATTERNS: list[tuple[str, str]] = [
-    (r"work.{0,12}authoriz|right.{0,6}work|eligible.{0,6}work|legally.{0,6}work", "Yes"),
-    (r"require.{0,12}sponsor|visa.{0,6}sponsor|need.{0,6}sponsor", "No"),
+    (r"work.{0,20}authoriz|authoriz.{0,20}work|right.{0,12}work|eligible.{0,12}work|"
+     r"legally.{0,20}work|permit.{0,12}work|work.{0,12}permit", "Yes"),
+    (r"sponsor", "No"),  # any sponsorship/visa-sponsorship question -> No (Indian citizen in India)
     (r"criminal|felony|convicted|arrest", "No"),
     (r"non.?compet|non.?disclosure|nda", "Yes"),
     (r"total.{0,8}years?.{0,12}exp|years?.{0,12}total.{0,12}exp", "12"),
@@ -435,12 +436,76 @@ def fill_page_fields(
 # Radio button filler (LinkedIn Easy Apply style: fieldset + legend)
 # ---------------------------------------------------------------------------
 
-def fill_radio_groups(page, profile: dict, resume_text: str = "") -> int:
-    """Fill radio button groups on a form page."""
-    filled = 0
+def _radio_option_text(page, r) -> str:
+    """Best-effort visible label for a single radio input."""
+    lbl_id = r.get_attribute("id")
+    if lbl_id:
+        lbl = page.query_selector(f'label[for="{lbl_id}"]')
+        if lbl:
+            t = lbl.inner_text().strip()
+            if t:
+                return t
+    aria = r.get_attribute("aria-label")
+    if aria:
+        return aria.strip()
+    # label ancestor
     try:
-        fieldsets = page.query_selector_all("fieldset")
-        for fs in fieldsets:
+        t = r.evaluate("el => { const l = el.closest('label'); return l ? l.innerText : ''; }")
+        if t and t.strip():
+            return t.strip()
+    except Exception:
+        pass
+    return r.get_attribute("value") or ""
+
+
+def _radio_group_question(page, first_radio, name: str) -> str:
+    """Find the question text for a name-grouped radio set (no fieldset/legend)."""
+    # aria-labelledby on the group container or the radio itself
+    lbl = _get_element_label(page, first_radio)
+    if lbl and lbl.lower() not in ("yes", "no"):
+        return lbl
+    # Walk up to a container and grab its leading text / a label / legend / [role=group] aria
+    try:
+        txt = first_radio.evaluate(
+            """el => {
+                let node = el;
+                for (let i = 0; i < 5 && node; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const grp = node.matches('[role=\\'group\\'],[role=\\'radiogroup\\'],fieldset,'
+                              + '[data-automation-id]') ? node : null;
+                    if (grp) {
+                        const al = grp.getAttribute('aria-label');
+                        if (al) return al;
+                        const leg = grp.querySelector('legend,label,h2,h3,.gwt-Label,[id$=\\'label\\']');
+                        if (leg && leg.innerText.trim()) return leg.innerText;
+                    }
+                }
+                return '';
+            }"""
+        )
+        if txt and txt.strip():
+            return txt.strip().rstrip("*").strip()
+    except Exception:
+        pass
+    return name  # last resort: the field name itself (e.g. 'work_auth')
+
+
+def fill_radio_groups(page, profile: dict, resume_text: str = "") -> int:
+    """
+    Fill radio button groups on a form page.
+
+    Handles two layouts:
+      1. <fieldset><legend>Question</legend> ... </fieldset>  (LinkedIn Easy Apply)
+      2. radios sharing a `name` attribute with the question in a nearby label /
+         aria-label / container (Workday and most standard HTML forms)
+    """
+    filled = 0
+    handled_names: set = set()
+
+    # ── Layout 1: fieldset + legend ─────────────────────────────────────────
+    try:
+        for fs in page.query_selector_all("fieldset"):
             try:
                 legend = fs.query_selector("legend")
                 if not legend:
@@ -449,29 +514,63 @@ def fill_radio_groups(page, profile: dict, resume_text: str = "") -> int:
                 radios = fs.query_selector_all('input[type="radio"]')
                 if not radios:
                     continue
-
-                options: list[tuple[str, object]] = []
+                options = [(_radio_option_text(page, r), r) for r in radios]
                 for r in radios:
-                    lbl_id = r.get_attribute("id")
-                    lbl = page.query_selector(f'label[for="{lbl_id}"]') if lbl_id else None
-                    opt_text = lbl.inner_text().strip() if lbl else r.get_attribute("value") or ""
-                    options.append((opt_text, r))
-
-                option_texts = [o[0] for o in options]
-                answer = get_preset_answer(question, profile)
-                if answer is None:
-                    answer = ask_claude(question, "radio", option_texts, profile, resume_text)
-
-                best = find_best_option(answer, option_texts)
-                if best:
-                    for opt_text, radio_el in options:
-                        if opt_text == best:
-                            radio_el.click()
-                            filled += 1
-                            print(f"    [FormFillerAI] Radio '{question[:40]}' ← '{best[:30]}'")
-                            break
+                    nm = r.get_attribute("name")
+                    if nm:
+                        handled_names.add(nm)
+                if _select_radio(page, question, options, profile, resume_text):
+                    filled += 1
             except Exception:
                 pass
     except Exception:
         pass
+
+    # ── Layout 2: radios grouped by `name` attribute ────────────────────────
+    try:
+        groups: dict = {}
+        for r in page.query_selector_all('input[type="radio"]'):
+            try:
+                if not r.is_visible():
+                    continue
+                nm = r.get_attribute("name") or ""
+                if not nm or nm in handled_names:
+                    continue
+                groups.setdefault(nm, []).append(r)
+            except Exception:
+                pass
+
+        for nm, radios in groups.items():
+            try:
+                options = [(_radio_option_text(page, r), r) for r in radios]
+                question = _radio_group_question(page, radios[0], nm)
+                if _select_radio(page, question, options, profile, resume_text):
+                    filled += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return filled
+
+
+def _select_radio(page, question, options, profile, resume_text) -> bool:
+    """Choose and click the best radio option for a question. Returns True if clicked."""
+    option_texts = [o[0] for o in options if o[0]]
+    if not option_texts:
+        return False
+    answer = get_preset_answer(question, profile)
+    if answer is None:
+        answer = ask_claude(question, "radio", option_texts, profile, resume_text)
+    best = find_best_option(answer, option_texts)
+    if not best:
+        return False
+    for opt_text, radio_el in options:
+        if opt_text == best:
+            try:
+                radio_el.click()
+                print(f"    [FormFillerAI] Radio '{question[:40]}' ← '{best[:30]}'")
+                return True
+            except Exception:
+                return False
+    return False
