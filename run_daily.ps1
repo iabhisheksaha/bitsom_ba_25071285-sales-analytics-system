@@ -23,9 +23,10 @@ function Get-VaultSecret([string]$Target) {
     return $c.GetNetworkCredential().Password
 }
 
-$env:CRED_KEY           = Get-VaultSecret "JobApp_CRED_KEY"
-$env:TELEGRAM_BOT_TOKEN = Get-VaultSecret "JobApp_TELEGRAM_BOT_TOKEN"
-$env:TELEGRAM_CHAT_ID   = Get-VaultSecret "JobApp_TELEGRAM_CHAT_ID"
+$env:CRED_KEY            = Get-VaultSecret "JobApp_CRED_KEY"
+$env:TELEGRAM_BOT_TOKEN  = Get-VaultSecret "JobApp_TELEGRAM_BOT_TOKEN"
+$env:TELEGRAM_CHAT_ID    = Get-VaultSecret "JobApp_TELEGRAM_CHAT_ID"
+$env:ANTHROPIC_API_KEY   = Get-VaultSecret "JobApp_ANTHROPIC_API_KEY"
 
 # ── Local-run browser settings ──────────────────────────────────────────────
 # Running on your own machine (residential IP) is what makes LinkedIn/Naukri
@@ -48,8 +49,9 @@ python orchestrator.py 2>&1 | Tee-Object -Append -FilePath "$JobAppDir\logs\sche
 "[$timestamp] Run complete." | Out-File -Append -FilePath "$JobAppDir\logs\scheduler.log"
 
 # ── Clear secrets from process memory when done ─────────────────────────────
-Remove-Item Env:\CRED_KEY           -ErrorAction SilentlyContinue
-Remove-Item Env:\TELEGRAM_BOT_TOKEN -ErrorAction SilentlyContinue
-Remove-Item Env:\TELEGRAM_CHAT_ID   -ErrorAction SilentlyContinue
+Remove-Item Env:\CRED_KEY            -ErrorAction SilentlyContinue
+Remove-Item Env:\TELEGRAM_BOT_TOKEN  -ErrorAction SilentlyContinue
+Remove-Item Env:\TELEGRAM_CHAT_ID    -ErrorAction SilentlyContinue
+Remove-Item Env:\ANTHROPIC_API_KEY   -ErrorAction SilentlyContinue
 Remove-Item Env:\BROWSER_PROFILE_DIR -ErrorAction SilentlyContinue
-Remove-Item Env:\HEADLESS           -ErrorAction SilentlyContinue
+Remove-Item Env:\HEADLESS            -ErrorAction SilentlyContinue

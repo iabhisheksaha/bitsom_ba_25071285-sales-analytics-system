@@ -21,6 +21,12 @@ from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as 
 
 from agents.agent1_job_discovery import JobPosting
 from agents.agent4_credentials import CredentialManager
+from utils.ai_form_filler import (
+    fill_page_fields,
+    fill_radio_groups,
+    load_applicant_profile,
+    extract_resume_text,
+)
 
 
 _ATS_DOMAINS_TUPLE = (
@@ -559,28 +565,67 @@ class LinkedInHandler(BaseApplicationHandler):
 
             easy_apply = self._find_easy_apply_btn()
             if easy_apply:
-                # ── Easy Apply inline flow ──────────────────────────────
+                # ── Easy Apply inline multi-step flow ──────────────────
                 easy_apply.click()
                 self.page.wait_for_timeout(2000)
-                for _ in range(6):
-                    upload = self.page.query_selector("input[type='file']")
-                    if upload:
+
+                profile = _load_applicant_profile()
+                resume_text = extract_resume_text(resume_path)
+
+                for step in range(12):
+                    # AI-fill all visible form fields on this step
+                    fill_page_fields(self.page, profile, resume_text)
+                    fill_radio_groups(self.page, profile, resume_text)
+                    self.page.wait_for_timeout(500)
+
+                    # Upload resume if file input present and empty
+                    upload = self.page.query_selector(
+                        "input[type='file']:not([style*='display: none'])"
+                    )
+                    if upload and upload.is_visible():
                         upload.set_input_files(str(resume_path.absolute()))
                         self.page.wait_for_timeout(1000)
-                    submit_btn = self.page.query_selector("button[aria-label*='Submit']")
-                    next_btn   = self.page.query_selector("button[aria-label*='Next']")
-                    review_btn = self.page.query_selector("button[aria-label*='Review']")
-                    if submit_btn:
+
+                    # Uncheck optional "follow company" to avoid noise
+                    follow_chk = self.page.query_selector(
+                        "input[type='checkbox'][id*='follow']"
+                    )
+                    if follow_chk and follow_chk.is_checked():
+                        follow_chk.click()
+
+                    submit_btn = self.page.query_selector(
+                        "button[aria-label*='Submit'], button:has-text('Submit application')"
+                    )
+                    next_btn   = self.page.query_selector(
+                        "button[aria-label*='Next'], button:has-text('Next')"
+                    )
+                    review_btn = self.page.query_selector(
+                        "button[aria-label*='Review'], button:has-text('Review')"
+                    )
+                    done_btn   = self.page.query_selector(
+                        "button[aria-label*='Done'], button:has-text('Done')"
+                    )
+
+                    if submit_btn and submit_btn.is_visible():
                         submit_btn.click()
-                        self.page.wait_for_timeout(2000)
-                        break
-                    elif review_btn:
+                        self.page.wait_for_timeout(3000)
+                        content = self.page.content()
+                        if any(kw in content for kw in
+                               ["Application submitted", "applied successfully",
+                                "You applied", "application was sent"]):
+                            print(f"    [LinkedIn] Easy Apply confirmed ✓")
+                        if done_btn:
+                            done_btn.click()
+                        return True
+                    elif review_btn and review_btn.is_visible():
                         review_btn.click()
                         self.page.wait_for_timeout(1000)
-                    elif next_btn:
+                    elif next_btn and next_btn.is_visible():
                         next_btn.click()
-                        self.page.wait_for_timeout(1000)
+                        self.page.wait_for_timeout(1500)
                     else:
+                        if step > 0:
+                            return True
                         break
                 return True
 
@@ -658,6 +703,9 @@ class WorkdayHandler(BaseApplicationHandler):
             return False
 
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
+        profile = _load_applicant_profile()
+        resume_text = extract_resume_text(resume_path)
+
         try:
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2000)
@@ -667,18 +715,36 @@ class WorkdayHandler(BaseApplicationHandler):
             if apply_btn:
                 apply_btn.click()
                 self.page.wait_for_timeout(2000)
-            for _ in range(10):
-                upload = self.page.query_selector("input[type='file']")
-                if upload:
+
+            for step in range(12):
+                # Upload resume / cover letter file input if visible
+                upload = self.page.query_selector(
+                    "input[type='file']:not([style*='display: none'])"
+                )
+                if upload and upload.is_visible():
                     upload.set_input_files(str(resume_path.absolute()))
                     self.page.wait_for_timeout(1000)
-                done = self.page.query_selector("[data-automation-id='bottom-navigation-done-btn']")
-                nxt  = self.page.query_selector("[data-automation-id='bottom-navigation-next-btn']")
-                if done:
+
+                # AI-fill all visible form fields on this wizard step
+                fill_page_fields(self.page, profile, resume_text)
+                fill_radio_groups(self.page, profile, resume_text)
+                self.page.wait_for_timeout(500)
+
+                done   = self.page.query_selector("[data-automation-id='bottom-navigation-done-btn']")
+                nxt    = self.page.query_selector("[data-automation-id='bottom-navigation-next-btn']")
+                submit = self.page.query_selector(
+                    "[data-automation-id='submitButton'], button:has-text('Submit')"
+                )
+
+                if done and done.is_visible():
                     done.click()
                     self.page.wait_for_timeout(2000)
-                    break
-                elif nxt:
+                    return True
+                elif submit and submit.is_visible():
+                    submit.click()
+                    self.page.wait_for_timeout(2000)
+                    return True
+                elif nxt and nxt.is_visible():
                     nxt.click()
                     self.page.wait_for_timeout(1500)
                 else:
@@ -699,26 +765,46 @@ class GreenhouseHandler(BaseApplicationHandler):
         try:
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2000)
+
+            # Greenhouse embeds its form inside an iframe on some pages.
+            # Navigate directly to the iframe src for reliable access.
+            iframe = self.page.query_selector("iframe#grnhse_app, iframe[src*='greenhouse']")
+            if iframe:
+                src = iframe.get_attribute("src") or ""
+                if src.startswith("http"):
+                    self.page.goto(src, timeout=30000, wait_until="domcontentloaded")
+                    self.page.wait_for_timeout(2000)
+
             profile = _load_applicant_profile()
+            resume_text = extract_resume_text(resume_path)
+
+            # Explicit contact fields (reliable selectors)
             for sel, val in [
                 ("#first_name, [name='job_application[first_name]']",  profile.get("first_name", "")),
-                ("#last_name,  [name='job_application[last_name]']",   profile.get("last_name", "")),
-                ("#email,      [name='job_application[email]']",        profile.get("email", "")),
-                ("#phone,      [name='job_application[phone]']",        profile.get("phone", "")),
+                ("#last_name, [name='job_application[last_name]']",    profile.get("last_name", "")),
+                ("#email, [name='job_application[email]']",            profile.get("email", "")),
+                ("#phone, [name='job_application[phone]']",            profile.get("phone", "")),
             ]:
                 el = self.page.query_selector(sel)
                 if el and val:
                     el.fill(val)
+
             upload = self.page.query_selector("#resume, input[type='file']")
             if upload:
                 upload.set_input_files(str(resume_path.absolute()))
                 self.page.wait_for_timeout(1000)
+
+            # AI-fill remaining custom questions, dropdowns, and select fields
+            fill_page_fields(self.page, profile, resume_text)
+            fill_radio_groups(self.page, profile, resume_text)
+
             submit = self.page.query_selector(
-                "#submit_app, [data-provides='submit-btn'], button:has-text('Submit Application')"
+                "#submit_app, [data-provides='submit-btn'], "
+                "button:has-text('Submit Application'), button[type='submit']"
             )
             if submit:
                 submit.click()
-                self.page.wait_for_timeout(2000)
+                self.page.wait_for_timeout(3000)
             return True
         except PWTimeout as exc:
             print(f"    [Greenhouse] Apply timeout: {exc}")
@@ -735,31 +821,50 @@ class LeverHandler(BaseApplicationHandler):
         try:
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2000)
-            apply_btn = self.page.query_selector("a:has-text('Apply'), button:has-text('Apply')")
-            if apply_btn:
-                apply_btn.click()
+
+            # Lever trick (proficiently-claude-skills): append /apply to the job URL
+            # to navigate directly to the application form instead of clicking Apply.
+            current_url = self.page.url.rstrip("/")
+            if not current_url.endswith("/apply"):
+                apply_url = current_url + "/apply"
+                self.page.goto(apply_url, timeout=30000, wait_until="domcontentloaded")
                 self.page.wait_for_timeout(2000)
+            else:
+                apply_btn = self.page.query_selector("a:has-text('Apply'), button:has-text('Apply')")
+                if apply_btn:
+                    apply_btn.click()
+                    self.page.wait_for_timeout(2000)
+
             profile = _load_applicant_profile()
+            resume_text = extract_resume_text(resume_path)
+
             for sel, val in [
-                ("[name='name']",    profile.get("name", "")),
-                ("[name='email']",   profile.get("email", "")),
-                ("[name='phone']",   profile.get("phone", "")),
-                ("[name='org']",     ""),  # current company — leave blank
-                ("[name='urls[LinkedIn]']", profile.get("linkedin_url", "")),
+                ("[name='name']",            profile.get("name", "")),
+                ("[name='email']",           profile.get("email", "")),
+                ("[name='phone']",           profile.get("phone", "")),
+                ("[name='org']",             ""),  # current company — leave blank
+                ("[name='urls[LinkedIn]']",  profile.get("linkedin_url", "")),
+                ("[name='urls[Portfolio]']", profile.get("portfolio_url", "")),
             ]:
                 el = self.page.query_selector(sel)
                 if el and val:
                     el.fill(val)
+
             upload = self.page.query_selector("input[type='file']")
             if upload:
                 upload.set_input_files(str(resume_path.absolute()))
                 self.page.wait_for_timeout(1000)
+
+            # AI-fill custom screening questions and dropdowns
+            fill_page_fields(self.page, profile, resume_text)
+            fill_radio_groups(self.page, profile, resume_text)
+
             submit = self.page.query_selector(
                 "button[type='submit'], button:has-text('Submit application')"
             )
             if submit:
                 submit.click()
-                self.page.wait_for_timeout(2000)
+                self.page.wait_for_timeout(3000)
             return True
         except PWTimeout as exc:
             print(f"    [Lever] Apply timeout: {exc}")
@@ -778,23 +883,10 @@ _applicant_profile_cache: "dict | None" = None
 
 def _load_applicant_profile() -> dict:
     global _applicant_profile_cache
-    if _applicant_profile_cache is not None:
-        return _applicant_profile_cache
-    try:
-        import yaml
-        cfg = yaml.safe_load(open("config/config.yaml"))
-        raw = cfg.get("applicant", {})
-        name_parts = raw.get("name", "").split(" ", 1)
-        _applicant_profile_cache = {
-            "name":         raw.get("name", ""),
-            "first_name":   name_parts[0] if name_parts else "",
-            "last_name":    name_parts[1] if len(name_parts) > 1 else "",
-            "email":        raw.get("email", ""),
-            "phone":        raw.get("phone", ""),
-            "linkedin_url": raw.get("linkedin_url", ""),
-        }
-    except Exception:
-        _applicant_profile_cache = {}
+    if _applicant_profile_cache is None:
+        _applicant_profile_cache = load_applicant_profile(
+            "config/config.yaml", "config/applicant_answers.yaml"
+        )
     return _applicant_profile_cache
 
 

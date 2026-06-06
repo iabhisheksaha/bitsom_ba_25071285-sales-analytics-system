@@ -1,0 +1,74 @@
+# Applicant pre-stored answers for common screening questions.
+# Used by utils/ai_form_filler.py — fill in your real details before first run.
+# Keys map to label patterns in _PROFILE_FIELD_PATTERNS; add custom keys as needed.
+
+# ------------------------------------------------------------------
+# Identity / contact
+# ------------------------------------------------------------------
+city: "Pune"
+state: "Maharashtra"
+country: "India"
+zip_code: "411001"
+website_url: ""
+github_url: ""
+portfolio_url: ""
+
+# ------------------------------------------------------------------
+# Current role & experience
+# ------------------------------------------------------------------
+current_role: "Senior Product Manager / Business Analyst"
+current_company: ""          # Leave blank — many forms pre-fill from LinkedIn
+years_of_experience: "12"
+years_product_experience: "10"
+years_ba_experience: "12"
+
+# ------------------------------------------------------------------
+# Compensation
+# ------------------------------------------------------------------
+current_ctc: "20 LPA"
+expected_ctc: "30 LPA"
+
+# ------------------------------------------------------------------
+# Logistics
+# ------------------------------------------------------------------
+notice_period: "60 days"
+willing_to_relocate: "Yes"
+willing_to_travel: "Yes, up to 25%"
+remote_preference: "Hybrid"
+
+# ------------------------------------------------------------------
+# Work authorization
+# ------------------------------------------------------------------
+work_authorization: "Yes"
+require_sponsorship: "No"
+visa_type: ""
+
+# ------------------------------------------------------------------
+# Education
+# ------------------------------------------------------------------
+highest_education: "Master of Business Administration"
+university: ""
+graduation_year: "2012"
+gpa: ""
+
+# ------------------------------------------------------------------
+# EEO / demographic (optional — leave blank to skip)
+# ------------------------------------------------------------------
+gender: "Male"
+ethnicity: "Asian"
+veteran_status: "I am not a protected veteran"
+disability_status: "I choose not to self-identify"
+
+# ------------------------------------------------------------------
+# Resume summary — injected into Claude prompts for screening questions.
+# Update this with a concise, keyword-rich summary of your background.
+# ------------------------------------------------------------------
+resume_summary: |
+  12+ years of experience spanning Product Management, Business Analysis, and Program
+  Management across BFSI, Fintech, and Enterprise SaaS. Delivered P&L impact of $10M+,
+  led cross-functional teams of 30+ members, and driven digital transformation initiatives
+  from concept through launch. Expertise in Agile/Scrum, product roadmapping, stakeholder
+  management, process re-engineering, and data-driven decision making. Previously served in
+  VP-level roles managing enterprise product portfolios. Certified PMP, CSPO, and Six Sigma
+  Green Belt. Seeking VP / Senior Director Product Owner or Business Analyst roles in Pune
+  with high-growth organisations.
