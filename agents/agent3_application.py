@@ -1082,11 +1082,11 @@ class WorkdayHandler(BaseApplicationHandler):
     def _handle_account_step(self, username: str, password: str) -> None:
         """
         Workday's 'Apply Manually' flow opens with a 'Create Account/Sign In'
-        wizard step. If we already have a Citi account, switch to Sign In and
-        enter credentials; otherwise create the account (email + password +
-        verify password + agree checkbox).
+        wizard step. We SIGN IN to the existing account - never create one.
+        Citi renders both a Sign In and a Create Account form; we deterministically
+        activate Sign In, fill ONLY email+password, and click the Sign In button.
+        We never fill 'Verify New Password' or click 'Create Account'.
         """
-        # Heading check - only act if this looks like the account step
         try:
             body = (self.page.inner_text("body") or "").lower()
         except Exception:
@@ -1096,60 +1096,101 @@ class WorkdayHandler(BaseApplicationHandler):
         if not username:
             return
 
-        # Prefer signing in: click a 'Sign In' toggle/link if present
-        for sel in ["a:has-text('Sign In')", "button:has-text('Sign In')",
-                    "[data-automation-id='signInLink']", "[data-automation-id='backToSignIn']"]:
+        # 1) Activate the Sign In form (Citi may default to Create Account).
+        #    'Already have an account? Sign In' is the toggle that reveals it.
+        for sel in ["[data-automation-id='backToSignInLink']",
+                    "[data-automation-id='signInLink']",
+                    "a:has-text('Sign In')", "button:has-text('Sign In')"]:
             el = self._visible(sel)
             if el:
                 try:
                     el.click()
-                    self.page.wait_for_timeout(1500)
+                    self.page.wait_for_timeout(1800)
+                    print("    [Workday] Switched to Sign In form.")
                     break
                 except Exception:
                     pass
 
-        epg, efr, email = self._find_anywhere(self._EMAIL_SEL)
+        # 2) Prefer fields/button scoped to the Sign In submit button's form,
+        #    so we don't accidentally fill the Create Account form.
+        signin_btn = self._visible("[data-automation-id='signInSubmitButton']")
+        email = pw = None
+        if signin_btn:
+            try:
+                # Find inputs within the same form/container as the Sign In button
+                email = signin_btn.evaluate_handle(
+                    """btn => {
+                        const form = btn.closest('form, [data-automation-id]') || document;
+                        return form.querySelector("input[type='email'],[data-automation-id='email'],"
+                             + "[data-automation-id='userName'],input[name='username']");
+                    }"""
+                ).as_element()
+                pw = signin_btn.evaluate_handle(
+                    """btn => {
+                        const form = btn.closest('form, [data-automation-id]') || document;
+                        return form.querySelector("[data-automation-id='password'],input[type='password']");
+                    }"""
+                ).as_element()
+            except Exception:
+                email = pw = None
+
         if not email:
+            _, _, email = self._find_anywhere(self._EMAIL_SEL)
+        if not pw:
+            _, _, pw = self._find_anywhere(self._PW_SEL)
+        if not email or not pw:
+            print("    [Workday] Could not locate Sign In email/password fields.")
             return
         try:
             email.fill(username)
-        except Exception:
+            pw.fill(password)
+            print("    [Workday] Entered Sign In credentials.")
+        except Exception as exc:
+            print(f"    [Workday] Could not fill Sign In fields: {str(exc)[:70]}")
             return
-        _, _, pw = self._find_anywhere(self._PW_SEL)
-        if pw:
+
+        # 3) Click the SIGN IN button only - never Create Account.
+        btn = self._visible("[data-automation-id='signInSubmitButton']")
+        if not btn:
+            # last resort: a Sign In submit button that is not Create Account
+            for sel in ["button:has-text('Sign In')", "button[type='submit']"]:
+                cand = self._visible(sel)
+                if cand:
+                    try:
+                        if "create account" in (cand.inner_text() or "").lower():
+                            continue
+                    except Exception:
+                        pass
+                    btn = cand
+                    break
+        if btn:
             try:
-                pw.fill(password)
+                btn.click(timeout=4000)
+                print("    [Workday] Clicked Sign In.")
+            except Exception as exc:
+                if "closed" not in str(exc).lower():
+                    print(f"    [Workday] Sign In click note: {str(exc)[:70]}")
+        else:
+            try:
+                pw.press("Enter")
             except Exception:
                 pass
-        # Verify-password field => we're in Create Account mode
-        verify = self._visible("[data-automation-id='verifyPassword'], "
-                               "input[autocomplete='new-password']:not([data-automation-id='password'])")
-        if verify:
-            try:
-                verify.fill(password)
-            except Exception:
-                pass
-            agree = self._visible("input[type='checkbox']")
-            if agree:
-                try:
-                    agree.check()
-                except Exception:
-                    pass
-        # Submit the account step
-        for sel in self._SUBMIT_SEL + ["[data-automation-id='createAccountSubmitButton']",
-                                       "button:has-text('Create Account')", "button:has-text('Continue')"]:
-            btn = self._visible(sel)
-            if btn:
-                try:
-                    btn.click(timeout=4000)
-                except Exception:
-                    pass
-                break
+
         self.page.wait_for_timeout(3500)
         try:
             self.page.wait_for_load_state("domcontentloaded")
         except Exception:
             pass
+
+        # Surface a sign-in error if shown (wrong password etc.)
+        _, _, err = self._find_anywhere(
+            ["[data-automation-id='errorMessage']", "[role='alert']", ".css-error"]
+        )
+        if err:
+            txt = (err.inner_text() or "").strip()[:120]
+            if txt and any(w in txt.lower() for w in ("incorrect", "invalid", "not match",
+                                                       "error", "try again", "match")):
+                print(f"    [Workday] Sign-in error: {txt}")
 
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
         profile = _load_applicant_profile()
