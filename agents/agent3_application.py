@@ -720,9 +720,18 @@ class WorkdayHandler(BaseApplicationHandler):
 
     def _robust_click(self, el, label: str = "") -> bool:
         """
-        Click an element that may be disabled-looking, covered by an invisible
-        anti-bot layer, or not yet 'actionable'. Tries: normal -> force -> JS click.
-        Returns True if any method dispatched the click.
+        Click an element that may be covered by an invisible anti-bot overlay or
+        not yet 'actionable'. Order matters:
+          1. normal click (the correct path when nothing intercepts)
+          2. JS click   - invokes the element's own click handler directly, so it
+                           IGNORES any overlay sitting on top (Citi's
+                           click-outside-catcher). This is the real bypass.
+          3. force click - LAST resort. NOTE: force only skips Playwright's safety
+                           check; the synthetic mouse event still lands on whatever
+                           is topmost at the coordinates, so on an overlay-covered
+                           button it clicks the OVERLAY, not the button. Hence it
+                           must come after the JS click, never before.
+        Returns True if a method plausibly dispatched the click to the element.
         """
         if el is None:
             return False
@@ -743,23 +752,23 @@ class WorkdayHandler(BaseApplicationHandler):
                 self.page.wait_for_timeout(200)
         except Exception:
             pass
-        # 1. normal (short timeout so we fail fast to the fallbacks)
+        # 1. normal
         try:
             el.click(timeout=2500)
             return True
         except Exception:
             pass
-        # 2. force - bypasses actionability/overlay interception
-        try:
-            el.click(timeout=2500, force=True)
-            print(f"    [Workday] {label}: used force-click.")
-            return True
-        except Exception:
-            pass
-        # 3. JS click - bypasses everything Playwright checks
+        # 2. JS click - directly fires the handler, bypassing any covering overlay
         try:
             el.evaluate("b => b.click()")
             print(f"    [Workday] {label}: used JS click.")
+            return True
+        except Exception:
+            pass
+        # 3. force click - last resort (may hit an overlay instead of the element)
+        try:
+            el.click(timeout=2500, force=True)
+            print(f"    [Workday] {label}: used force-click (last resort).")
             return True
         except Exception:
             pass
