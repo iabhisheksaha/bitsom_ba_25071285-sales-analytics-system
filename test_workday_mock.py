@@ -29,12 +29,19 @@ from agents.agent3_application import WorkdayHandler, CHROMIUM_BIN
 PORT = 18091
 STATE = {"signed_in": False, "step": 0, "submitted": False, "uploaded": False}
 
-# Workday candidate sign-in page (defaults to Create Account tab; Sign In is a link)
+# Citi-style sign-in: cookie banner on top + sign-in modal with email/password
+# already present in the main page DOM (no popup).
 SIGNIN_PAGE = """<html><body>
-  <h1>Welcome</h1>
-  <a data-automation-id="signInLink" href="#" onclick="document.getElementById('f').style.display='block';return false;">Sign In</a>
-  <div id="f" style="display:none">
+  <div id="cookie" style="position:fixed;top:0;left:0;right:0;background:#eee;padding:10px;">
+    This site uses cookies.
+    <button data-automation-id="legalNoticeAcceptButton"
+            onclick="document.getElementById('cookie').remove()">Accept Cookies</button>
+  </div>
+  <h1>Start Your Application</h1>
+  <div id="signin">
+    <label>Email Address *</label>
     <input type="email" data-automation-id="email" />
+    <label>Password *</label>
     <input type="password" data-automation-id="password" />
     <button data-automation-id="signInSubmitButton"
             onclick="window.location='/job/apply'">Sign In</button>

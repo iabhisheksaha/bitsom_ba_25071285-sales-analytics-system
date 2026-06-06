@@ -758,15 +758,40 @@ class WorkdayHandler(BaseApplicationHandler):
     _SIGNIN_LINK_SEL = ["[data-automation-id='signInLink']", "a:has-text('Sign In')",
                         "button:has-text('Sign In')", "a:has-text('Sign in')"]
 
+    _COOKIE_SEL = [
+        "[data-automation-id='legalNoticeAcceptButton']",
+        "#onetrust-accept-btn-handler",
+        "button:has-text('Accept Cookies')",
+        "button:has-text('Accept All')",
+        "button:has-text('Accept')",
+        "[aria-label='Accept Cookies']",
+    ]
+
+    def _dismiss_overlays(self) -> None:
+        """Accept the cookie-consent banner so it stops intercepting clicks."""
+        for sel in self._COOKIE_SEL:
+            try:
+                el = self.page.query_selector(sel)
+                if el and el.is_visible():
+                    el.click()
+                    self.page.wait_for_timeout(800)
+                    print(f"    [Workday] Dismissed cookie banner ({sel}).")
+                    return
+            except Exception:
+                pass
+
     def login(self, username: str, password: str) -> bool:
         """
-        Sign in to the candidate account. Citi (and many Workday tenants) open
-        the sign-in form in a POPUP window or an iframe, so we search every
-        page+frame in the context, not just the main page.
+        Sign in to the candidate account. Citi renders the sign-in form as a
+        modal in the main page (Email Address / Password) behind a cookie-consent
+        banner, with a 'Start Your Application' chooser overlaid. We dismiss the
+        cookie banner first, then search every page+frame for the credentials.
         """
         try:
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2500)
+            self._dismiss_overlays()
+            self.page.wait_for_timeout(800)
 
             # Already signed in (e.g. via a manual login saved in the profile)?
             # Apply/wizard controls or a 'Sign Out'/account menu would be visible,
@@ -925,6 +950,7 @@ class WorkdayHandler(BaseApplicationHandler):
         'Start Your Application' chooser: Autofill with Resume / Apply Manually /
         Use My Last Application. Pick a path that lands us in the form wizard.
         """
+        self._dismiss_overlays()
         apply_btn = (
             self._visible("[data-automation-id='applyButton']") or
             self._visible("a:has-text('Apply')") or
