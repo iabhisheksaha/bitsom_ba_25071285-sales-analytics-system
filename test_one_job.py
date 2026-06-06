@@ -176,6 +176,15 @@ def main():
             print(f"  [Test] Applying...")
             success = handler.apply(job, resume)
             print(f"\n[Test] Result: {'*** SUBMITTED ***' if success else 'FAILED'}")
+            if not success:
+                try:
+                    shot = Path("logs") / "last_failure.png"
+                    shot.parent.mkdir(exist_ok=True)
+                    page.screenshot(path=str(shot), full_page=True)
+                    print(f"[Test] Saved screenshot of failure state -> {shot.resolve()}")
+                    print("[Test] Send me that PNG and the lines above to debug.")
+                except Exception as _e:
+                    print(f"[Test] (could not save screenshot: {_e})")
 
         except KeyboardInterrupt:
             print("\n[Test] Interrupted by user.")

@@ -709,6 +709,7 @@ class WorkdayHandler(BaseApplicationHandler):
     """Handles *.myworkdayjobs.com / *.workday.com - requires a candidate account login."""
 
     def _visible(self, selector: str):
+        """Find a visible element on self.page only."""
         try:
             el = self.page.query_selector(selector)
             if el and el.is_visible():
@@ -717,74 +718,193 @@ class WorkdayHandler(BaseApplicationHandler):
             pass
         return None
 
+    def _targets(self) -> list:
+        """
+        All frames across all pages in the browser context - so we can find
+        login fields whether they render on the main page, inside an iframe,
+        or in a popup window (Citi opens sign-in in a popup).
+        """
+        targets = []
+        try:
+            for pg in self.page.context.pages:
+                try:
+                    for fr in pg.frames:
+                        targets.append((pg, fr))
+                except Exception:
+                    pass
+        except Exception:
+            targets.append((self.page, self.page.main_frame))
+        return targets
+
+    def _find_anywhere(self, selectors):
+        """Search every page+frame for the first visible match. Returns (page, frame, element)."""
+        for sel in selectors:
+            for pg, fr in self._targets():
+                try:
+                    el = fr.query_selector(sel)
+                    if el and el.is_visible():
+                        return pg, fr, el
+                except Exception:
+                    pass
+        return None, None, None
+
+    _EMAIL_SEL = ["[data-automation-id='email']", "[data-automation-id='userName']",
+                  "input[type='email']", "input[name='username']", "input[autocomplete='username']"]
+    _PW_SEL    = ["[data-automation-id='password']", "input[type='password']",
+                  "input[autocomplete='current-password']"]
+    _SUBMIT_SEL = ["[data-automation-id='signInSubmitButton']", "[data-automation-id='click_filter']",
+                   "button[type='submit']", "[data-automation-id='signInButton']",
+                   "button:has-text('Sign In')"]
+    _SIGNIN_LINK_SEL = ["[data-automation-id='signInLink']", "a:has-text('Sign In')",
+                        "button:has-text('Sign In')", "a:has-text('Sign in')"]
+
     def login(self, username: str, password: str) -> bool:
         """
-        Sign in to the candidate account. Navigating to a Workday /apply URL
-        while unauthenticated redirects to the candidate sign-in page, which
-        may default to the 'Create Account' tab - so click 'Sign In' first.
+        Sign in to the candidate account. Citi (and many Workday tenants) open
+        the sign-in form in a POPUP window or an iframe, so we search every
+        page+frame in the context, not just the main page.
         """
         try:
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2500)
 
-            # If already signed in, the apply wizard / Apply button is shown -> skip login
+            # Already signed in? Apply wizard / Apply button would be visible.
             if self._visible("[data-automation-id='applyButton']") or \
                self._visible("[data-automation-id='bottom-navigation-next-btn']"):
                 print("    [Workday] Candidate account already signed in.")
                 return True
 
-            # Switch to the Sign In tab if the page opened on Create Account
-            sign_in_tab = (
-                self._visible("[data-automation-id='signInLink']") or
-                self._visible("a:has-text('Sign In')") or
-                self._visible("button:has-text('Sign In')")
-            )
-            if sign_in_tab:
-                sign_in_tab.click()
-                self.page.wait_for_timeout(1500)
+            # If no email field is visible yet, click a 'Sign In' link/tab.
+            # That click may spawn a popup window - capture it.
+            _, _, email_now = self._find_anywhere(self._EMAIL_SEL)
+            if not email_now:
+                _, _, link = self._find_anywhere(self._SIGNIN_LINK_SEL)
+                if link:
+                    print("    [Workday] Clicking 'Sign In' (watching for popup)...")
+                    try:
+                        with self.page.context.expect_page(timeout=5000) as pinfo:
+                            link.click()
+                        popup = pinfo.value
+                        popup.wait_for_load_state("domcontentloaded")
+                        popup.wait_for_timeout(1500)
+                        print(f"    [Workday] Sign-in popup opened: {popup.url[:70]}")
+                    except Exception:
+                        # No popup -> modal/iframe on same page
+                        self.page.wait_for_timeout(2000)
 
-            email = self._visible("[data-automation-id='email']") or self._visible("input[type='email']")
+            # Locate the email field anywhere (main page / iframe / popup)
+            epg, efr, email = self._find_anywhere(self._EMAIL_SEL)
             if not email:
-                print("    [Workday] No email field found - cannot sign in.")
+                self._dump_targets("no email field")
+                print("    [Workday] No email field found anywhere - cannot sign in.")
                 return False
             email.fill(username)
+            print(f"    [Workday] Email entered on {epg.url[:55]}")
 
-            # Some Workday tenants split email/password across a 'Next' step
-            nxt = self._visible("[data-automation-id='nextButton']")
-            if nxt:
-                nxt.click()
-                self.page.wait_for_timeout(1500)
-
-            pw = self._visible("[data-automation-id='password']") or self._visible("input[type='password']")
+            # Email-first flow: a Next/Continue may appear before the password
+            pw = None
+            for sel in self._PW_SEL:
+                try:
+                    cand = efr.query_selector(sel)
+                    if cand and cand.is_visible():
+                        pw = cand
+                        break
+                except Exception:
+                    pass
             if not pw:
-                print("    [Workday] No password field found - cannot sign in.")
+                # try clicking a Next button in the same frame, then re-find password
+                for nsel in ["[data-automation-id='nextButton']", "button:has-text('Next')",
+                             "button:has-text('Continue')"]:
+                    try:
+                        nb = efr.query_selector(nsel)
+                        if nb and nb.is_visible():
+                            nb.click()
+                            efr.wait_for_timeout(1500) if hasattr(efr, "wait_for_timeout") else self.page.wait_for_timeout(1500)
+                            break
+                    except Exception:
+                        pass
+                _, efr2, pw = self._find_anywhere(self._PW_SEL)
+                if efr2:
+                    efr = efr2
+            if not pw:
+                self._dump_targets("no password field")
+                print("    [Workday] No password field found anywhere - cannot sign in.")
                 return False
             pw.fill(password)
+            print("    [Workday] Password entered.")
 
-            submit = (
-                self._visible("[data-automation-id='signInSubmitButton']") or
-                self._visible("button[type='submit']") or
-                self._visible("[data-automation-id='signInButton']")
+            # Submit within the same frame, else search, else press Enter
+            submit = None
+            for sel in self._SUBMIT_SEL:
+                try:
+                    cand = efr.query_selector(sel)
+                    if cand and cand.is_visible():
+                        submit = cand
+                        break
+                except Exception:
+                    pass
+            if not submit:
+                _, _, submit = self._find_anywhere(self._SUBMIT_SEL)
+            # Clicking submit may close the popup (Citi calls window.close()),
+            # which raises TargetClosedError - that close IS the success signal.
+            try:
+                if submit:
+                    submit.click(timeout=4000)
+                else:
+                    pw.press("Enter")
+            except Exception as exc:
+                if "closed" in str(exc).lower():
+                    print("    [Workday] Sign-in popup closed after submit (expected).")
+                else:
+                    print(f"    [Workday] Submit click note: {str(exc)[:80]}")
+            self.page.wait_for_timeout(4500)
+            try:
+                self.page.wait_for_load_state("domcontentloaded")
+            except Exception:
+                pass
+
+            # Sign-in error banner anywhere?
+            _, _, err = self._find_anywhere(
+                ["[data-automation-id='errorMessage']", ".css-error", "[role='alert']"]
             )
-            if submit:
-                submit.click()
-            else:
-                pw.press("Enter")
-            self.page.wait_for_timeout(4000)
-            self.page.wait_for_load_state("domcontentloaded")
-
-            # Check for a sign-in error banner
-            err = self._visible("[data-automation-id='errorMessage'], .css-error, [role='alert']")
             if err:
-                txt = (err.inner_text() or "").strip()[:120]
-                if "incorrect" in txt.lower() or "invalid" in txt.lower() or "error" in txt.lower():
+                txt = (err.inner_text() or "").strip()[:140]
+                if any(w in txt.lower() for w in ("incorrect", "invalid", "not match", "error", "try again")):
                     print(f"    [Workday] Sign-in error: {txt}")
                     return False
-            print(f"    [Workday] Signed in - URL: {self.page.url[:70]}")
+
+            # Bring focus back to the main application page (popup usually closes)
+            try:
+                self.page.bring_to_front()
+            except Exception:
+                pass
+            print(f"    [Workday] Signed in - main URL: {self.page.url[:70]}")
             return True
         except PWTimeout as exc:
             print(f"    [Workday] Login timeout: {exc}")
             return False
+
+    def _dump_targets(self, why: str) -> None:
+        """Diagnostic: list pages/frames and visible inputs to explain a login failure."""
+        print(f"    [Workday][diag] {why}. Context state:")
+        try:
+            for i, pg in enumerate(self.page.context.pages):
+                print(f"      page[{i}] url={pg.url[:75]}")
+                for j, fr in enumerate(pg.frames):
+                    try:
+                        inputs = fr.query_selector_all("input")
+                        descs = []
+                        for inp in inputs[:8]:
+                            t = inp.get_attribute("type") or "text"
+                            aid = inp.get_attribute("data-automation-id") or inp.get_attribute("name") or ""
+                            vis = inp.is_visible()
+                            descs.append(f"{t}:{aid}{'(vis)' if vis else ''}")
+                        if descs:
+                            print(f"        frame[{j}] {fr.url[:55]} inputs=[{', '.join(descs)}]")
+                    except Exception:
+                        pass
+        except Exception as exc:
+            print(f"      [diag] dump failed: {exc}")
 
     def _start_application(self, resume_path: Path) -> None:
         """
