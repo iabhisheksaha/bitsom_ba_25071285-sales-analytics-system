@@ -18,9 +18,45 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+class _Tee:
+    """Mirror stdout/stderr to a log file so the full run can be shared as one file."""
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+
+    def write(self, data):
+        try:
+            self._stream.write(data)
+        except Exception:
+            pass
+        try:
+            self._fh.write(data)
+            self._fh.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        for t in (self._stream, self._fh):
+            try:
+                t.flush()
+            except Exception:
+                pass
+
+
+def _start_logging() -> Path:
+    Path("logs").mkdir(exist_ok=True)
+    log_path = Path("logs") / "citi_run.log"
+    fh = open(log_path, "w", encoding="utf-8")
+    fh.write(f"=== test_one_job run {datetime.now().isoformat()} ===\n")
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    return log_path
 
 import yaml
 from playwright.sync_api import sync_playwright
@@ -80,6 +116,19 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Fill forms but do NOT click the final Submit button")
     args = parser.parse_args()
+
+    log_path = _start_logging()
+    print(f"[Test] Full log being written to: {log_path.resolve()}")
+    print(f"[Test] git HEAD:")
+    try:
+        import subprocess
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+        subj = subprocess.run(["git", "log", "-1", "--format=%s"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+        print(f"[Test]   {head}  {subj}")
+    except Exception as _e:
+        print(f"[Test]   (could not read git HEAD: {_e})")
 
     resume = Path("resume/base_resume.docx")
     if not resume.exists():
@@ -193,7 +242,11 @@ def main():
             print(f"\n[Test] ERROR: {exc}")
             traceback.print_exc()
         finally:
-            print("\n[Test] Browser closes in 5s (Ctrl+C to keep it open)...")
+            print("\n" + "=" * 60)
+            print("[Test] SEND ME THIS FILE:  logs\\citi_run.log")
+            print("[Test] (and logs\\last_failure.png if it failed)")
+            print("=" * 60)
+            print("[Test] Browser closes in 5s (Ctrl+C to keep it open)...")
             try:
                 time.sleep(5)
             except KeyboardInterrupt:

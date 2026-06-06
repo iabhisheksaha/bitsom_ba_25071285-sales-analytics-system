@@ -32,6 +32,10 @@ logs/scheduler.log
 logs/test_*.json
 logs/test_credentials.enc
 
+# Single-job test run artefacts
+logs/citi_run.log
+logs/last_failure.png
+
 # IDE
 .idea/
 .vscode/
