@@ -638,11 +638,16 @@ class LinkedInScraper(BaseScraper):
                 continue
             company_el = card.select_one(".base-search-card__subtitle")
             loc_el     = card.select_one(".job-search-card__location")
-            link_el    = (
-                card.select_one("a.base-card__full-link") or
-                card.select_one("a[href*='/jobs/view/']")
-            )
-            href = link_el.get("href", "").split("?")[0] if link_el else ""
+            # Prefer the explicit /jobs/view/ link; base-card__full-link sometimes
+            # points to a /company/ page which causes the CAPTCHA alert on company pages.
+            job_link = card.select_one("a[href*='/jobs/view/']")
+            if not job_link:
+                candidate = card.select_one("a.base-card__full-link")
+                if candidate and "/jobs/view/" in candidate.get("href", ""):
+                    job_link = candidate
+            if not job_link:
+                continue  # no valid job-view URL - skip this card
+            href = job_link.get("href", "").split("?")[0]
             results.append(JobPosting(
                 platform="linkedin",
                 title=title_el.get_text(strip=True),
