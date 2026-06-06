@@ -1092,7 +1092,12 @@ class WorkdayHandler(BaseApplicationHandler):
             # falls back to a JS click which bypasses that interception. Clicking may
             # also close a popup (Citi window.close()) - handled inside _robust_click.
             if submit:
-                self._robust_click(submit, "Sign In (modal)")
+                # verify=email-gone so it keeps trying strategies (focus+Enter ->
+                # trusted-coordinate -> ...) until the modal actually authenticates.
+                self._robust_click(
+                    submit, "Sign In (modal)",
+                    verify=lambda: self._find_anywhere(self._EMAIL_SEL)[2] is None,
+                )
             else:
                 try:
                     pw.press("Enter")
@@ -1454,11 +1459,22 @@ class WorkdayHandler(BaseApplicationHandler):
                                                        "error", "try again", "match")):
                 print(f"    [Workday] Sign-in error: {txt}")
 
+    def _already_applied(self) -> bool:
+        """Detect Workday's 'You've already applied for this job' page."""
+        try:
+            body = (self.page.inner_text("body") or "").lower()
+        except Exception:
+            return False
+        return ("already applied for this job" in body or
+                "you have already applied" in body or
+                ("already applied" in body and "view my applications" in body))
+
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
         profile = _load_applicant_profile()
         resume_text = extract_resume_text(resume_path)
         username = getattr(self, "_login_user", "") or ""
         password = getattr(self, "_login_pass", "") or ""
+        self.already_applied = False
 
         try:
             self.page.wait_for_load_state("domcontentloaded")
@@ -1471,8 +1487,19 @@ class WorkdayHandler(BaseApplicationHandler):
             self._wait_for_step_content()
             self._handle_account_step(username, password)
 
+            # Citi may show 'You've already applied for this job' after sign-in.
+            if self._already_applied():
+                self.already_applied = True
+                print("    [Workday] Citi reports an application ALREADY EXISTS "
+                      "for this job (View My Applications). Nothing to submit.")
+                raise SkipApplication("already applied (existing application on Citi)")
+
             last_progress = ""
             for step in range(18):
+                if self._already_applied():
+                    self.already_applied = True
+                    print("    [Workday] 'Already applied' page reached - stopping.")
+                    raise SkipApplication("already applied (existing application on Citi)")
                 self._wait_for_step_content()
                 self._dismiss_overlays()
 
@@ -2402,7 +2429,12 @@ class ApplicationAgent:
                 self.log.record(job, "failed", f"{ats_label} login failed")
                 return
 
-        success = ext_handler.apply(job, resume_path)
+        try:
+            success = ext_handler.apply(job, resume_path)
+        except SkipApplication as exc:
+            self.log.record(job, "skipped", str(exc))
+            print(f"  [Agent3] SKIPPED ({ats_label}) — {job.company}: {exc}")
+            return
         status = "submitted" if success else "failed"
         self.log.record(job, status, "" if success else f"{ats_label} apply error")
         print(f"  [Agent3] {status.upper()} ({ats_label}) — {job.company}")

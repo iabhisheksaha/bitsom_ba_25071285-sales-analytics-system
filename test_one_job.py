@@ -223,9 +223,21 @@ def main():
                 return
 
             print(f"  [Test] Applying...")
-            success = handler.apply(job, resume)
-            print(f"\n[Test] Result: {'*** SUBMITTED ***' if success else 'FAILED'}")
-            if not success:
+            from agents.agent3_application import SkipApplication
+            try:
+                success = handler.apply(job, resume)
+            except SkipApplication as sk:
+                if getattr(handler, "already_applied", False):
+                    print(f"\n[Test] Result: ALREADY APPLIED - Citi already has an "
+                          f"application for this job ({sk}).")
+                    print("[Test] Try a job you have NEVER applied to (and that the bot "
+                          "has not touched) for a clean end-to-end submit test.")
+                else:
+                    print(f"\n[Test] Result: SKIPPED - {sk}")
+                success = None
+            if success is not None:
+                print(f"\n[Test] Result: {'*** SUBMITTED ***' if success else 'FAILED'}")
+            if success is False:
                 try:
                     shot = Path("logs") / "last_failure.png"
                     shot.parent.mkdir(exist_ok=True)
