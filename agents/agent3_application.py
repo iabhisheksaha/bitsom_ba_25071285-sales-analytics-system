@@ -629,10 +629,27 @@ class LinkedInHandler(BaseApplicationHandler):
                         break
                 return True
 
-            # ── No Easy Apply — look for external Apply button ─────────
-            ext_btn = self.page.query_selector(
-                "button:has-text('Apply'), a.jobs-apply-button"
-            )
+            # ── No Easy Apply — search for external apply button ───────
+            _EXT_SELECTORS = [
+                "button:has-text('Apply'):not(:has-text('Easy'))",
+                "a.jobs-apply-button",
+                ".jobs-apply-button--top-card a[href]",
+                "a[aria-label*='Apply']:not([aria-label*='Easy'])",
+                "button[aria-label*='Apply']:not([aria-label*='Easy'])",
+                "a[target='_blank'][rel*='noopener'][href*='://']",
+            ]
+            ext_btn = None
+            for _sel in _EXT_SELECTORS:
+                try:
+                    btn = self.page.query_selector(_sel)
+                    if btn and btn.is_visible():
+                        if (btn.text_content() or "").strip().lower() == "applied":
+                            continue
+                        ext_btn = btn
+                        break
+                except Exception:
+                    pass
+
             if ext_btn:
                 try:
                     with self.page.context.expect_page(timeout=8000) as popup_info:
@@ -643,12 +660,32 @@ class LinkedInHandler(BaseApplicationHandler):
                     popup.close()
                     raise ExternalApplicationRequired(external_url)
                 except PWTimeout:
-                    # Button didn't open a new tab — navigation happened in same page
+                    # Button didn't open a new tab — navigation in same page
                     self.page.wait_for_timeout(3000)
                     if self.page.url != job.url:
                         raise ExternalApplicationRequired(self.page.url)
 
-            raise SkipApplication("No apply button found on LinkedIn page")
+            # ── Last resort: scan page HTML for embedded ATS URLs ──────
+            try:
+                _hits = _ATS_URL_RE.findall(self.page.content())
+                if _hits:
+                    ext_url = _hits[0].replace('\\/', '/')
+                    print(f"    [LinkedIn] Found ATS URL in page source: {ext_url[:70]}")
+                    raise ExternalApplicationRequired(ext_url)
+            except ExternalApplicationRequired:
+                raise
+            except Exception:
+                pass
+
+            applied_badge = self.page.query_selector(
+                "button[aria-label*='Applied'], button:has-text('Applied')"
+            )
+            reason = (
+                "LinkedIn 'Applied' badge shown — no external ATS URL found in page"
+                if applied_badge else
+                "No apply button found on LinkedIn page"
+            )
+            raise SkipApplication(reason)
 
         except (SkipApplication, ExternalApplicationRequired):
             raise
@@ -871,12 +908,89 @@ class LeverHandler(BaseApplicationHandler):
             return False
 
 
+class GenericAtsHandler(BaseApplicationHandler):
+    """
+    Fallback handler for ATS platforms without a dedicated implementation.
+    Detects login wall, fills form via AI form filler, uploads resume, submits.
+    """
+
+    def login(self, username: str, password: str) -> bool:
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(2000)
+            pw_field = self.page.query_selector("input[type='password']")
+            if not pw_field:
+                return True  # No login wall visible
+            email_field = self.page.query_selector(
+                "input[type='email'], input[name*='email'], input[name*='user']"
+            )
+            if email_field:
+                email_field.fill(username)
+            pw_field.fill(password)
+            submit = self.page.query_selector(
+                "button[type='submit'], button:has-text('Sign In'), "
+                "button:has-text('Log In'), button:has-text('Login')"
+            )
+            if submit:
+                submit.click()
+                self.page.wait_for_timeout(3000)
+            return True
+        except PWTimeout as exc:
+            print(f"    [GenericATS] Login timeout: {exc}")
+            return False
+
+    def apply(self, job: JobPosting, resume_path: Path) -> bool:
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+            self.page.wait_for_timeout(2000)
+
+            # Click an Apply button if present (e.g. iCIMS / Taleo landing page)
+            apply_btn = self.page.query_selector(
+                "a:has-text('Apply Now'), button:has-text('Apply Now'), "
+                "a:has-text('Apply'), button:has-text('Apply')"
+            )
+            if apply_btn and apply_btn.is_visible():
+                apply_btn.click()
+                self.page.wait_for_timeout(2000)
+
+            profile = _load_applicant_profile()
+            resume_text = extract_resume_text(resume_path)
+            fill_page_fields(self.page, profile, resume_text)
+            fill_radio_groups(self.page, profile, resume_text)
+
+            upload = self.page.query_selector("input[type='file']")
+            if upload:
+                upload.set_input_files(str(resume_path.absolute()))
+                self.page.wait_for_timeout(1000)
+
+            submit = self.page.query_selector(
+                "button[type='submit'], button:has-text('Submit'), "
+                "button:has-text('Submit Application'), "
+                "button:has-text('Submit my application')"
+            )
+            if submit:
+                submit.click()
+                self.page.wait_for_timeout(2000)
+            return True
+        except PWTimeout as exc:
+            print(f"    [GenericATS] Apply timeout: {exc}")
+            return False
+
+
 _NO_LOGIN_ATS = {"greenhouse", "lever", "ashby"}
 
 _ATS_HANDLER_MAP: dict[str, type] = {
-    "workday":    WorkdayHandler,
-    "greenhouse": GreenhouseHandler,
-    "lever":      LeverHandler,
+    "workday":         WorkdayHandler,
+    "greenhouse":      GreenhouseHandler,
+    "lever":           LeverHandler,
+    # Use generic handler for remaining known ATS platforms
+    "icims":           GenericAtsHandler,
+    "taleo":           GenericAtsHandler,
+    "smartrecruiters": GenericAtsHandler,
+    "successfactors":  GenericAtsHandler,
+    "bamboohr":        GenericAtsHandler,
+    "jobvite":         GenericAtsHandler,
+    "ashby":           GenericAtsHandler,
 }
 
 _applicant_profile_cache: "dict | None" = None
@@ -913,7 +1027,8 @@ class ApplicationLog:
 
     def already_applied(self, job: JobPosting) -> bool:
         key = f"{job.platform}::{job.company}::{job.title}"
-        return key in self._data
+        entry = self._data.get(key)
+        return entry is not None and entry.get("status") == "submitted"
 
     def record(self, job: JobPosting, status: str, reason: str = "") -> None:
         key = f"{job.platform}::{job.company}::{job.title}"
@@ -1206,16 +1321,12 @@ class ApplicationAgent:
                 self.log.record(job, "skipped", "linkedin: easy-apply only (no off-site URL)")
                 return
             ats = detect_ats(ext_url)
-            if not ats:
-                print(f"  [Agent3/LinkedIn] Off-site URL not a supported ATS: {ext_url[:70]}")
-                self.log.record(job, "skipped", f"linkedin off-site unsupported ATS: {ext_url[:50]}")
-                return
-            print(f"  [Agent3/LinkedIn] Off-site apply URL ({ats}): {ext_url[:70]}")
+            print(f"  [Agent3/LinkedIn] Off-site apply URL ({ats or 'unknown'}): {ext_url[:70]}")
             try:
-                page.goto(ext_url, timeout=30000, wait_until="domcontentloaded")
+                # _handle_external_apply navigates itself; don't double-navigate
                 self._handle_external_apply(page, job, resume_path, ext_url)
             except Exception as exc:
-                print(f"  [Agent3/LinkedIn] ATS navigate error for {job.company}: {exc}")
+                print(f"  [Agent3/LinkedIn] ATS apply error for {job.company}: {exc}")
                 self.log.record(job, "failed", str(exc)[:100])
             return
 
@@ -1230,15 +1341,54 @@ class ApplicationAgent:
                 self._handle_external_apply(page, job, resume_path, current_url)
                 return
 
-            apply_link = (
-                page.query_selector("a[data-testid='viewJobButtonLinkComponent']") or
-                page.query_selector("a[href*='applyRedirect']") or
-                page.query_selector("a:has-text('Apply on company site')") or
-                page.query_selector("a:has-text('Apply now')") or
-                page.query_selector("button:has-text('Apply on company site')")
-            )
+            _ext_selectors = [
+                # Indeed-specific attributes
+                "a[data-testid='viewJobButtonLinkComponent']",
+                "a[href*='applyRedirect']",
+                "a[href*='apply_redirect']",
+                "a[href*='applyredirect']",
+                "#applyButtonLinkContainer a",
+                # Text-based (cover common capitalisation variants)
+                "a:has-text('Apply on company site')",
+                "button:has-text('Apply on company site')",
+                "a:has-text('Apply on Company Site')",
+                "button:has-text('Apply on Company Site')",
+                "a:has-text('Apply now')",
+                "a:has-text('Apply Now')",
+                "button:has-text('Apply now')",
+                "button:has-text('Apply Now')",
+                # Class / data heuristics
+                "a[class*='external-apply']",
+                "a[class*='companyApply']",
+                "a[class*='applyButton']",
+                "[data-testid='apply-button']",
+                # External-link heuristic (target=_blank, non-same-platform)
+                "a[target='_blank'][rel*='noopener'][href*='://']",
+            ]
+            apply_link = None
+            for _sel in _ext_selectors:
+                try:
+                    el = page.query_selector(_sel)
+                    if el and el.is_visible():
+                        href = el.get_attribute("href") or ""
+                        if any(s in href for s in [
+                            "indeed.com", "naukri.com", "linkedin.com",
+                            "javascript:", "#",
+                        ]):
+                            continue
+                        apply_link = el
+                        break
+                except Exception:
+                    pass
 
             if not apply_link:
+                # Scan page HTML for embedded ATS domain links
+                _hits = _ATS_URL_RE.findall(page.content())
+                if _hits:
+                    _html_ats_url = _hits[0].replace('\\/', '/')
+                    print(f"  [Agent3] Found ATS URL in page source: {_html_ats_url[:70]}")
+                    self._handle_external_apply(page, job, resume_path, _html_ats_url)
+                    return
                 print(f"  [Agent3] No external apply link on {current_url[:70]} — skipping.")
                 self.log.record(job, "skipped", "no external apply link")
                 return
@@ -1387,17 +1537,13 @@ class ApplicationAgent:
                 return
 
         # ── 4. Navigate Playwright to ATS URL ────────────────────────────
-        ats = detect_ats(ext_url)
-        if not ats:
-            print(f"  [Agent3/Naukri] URL not a known ATS: {ext_url[:80]}")
-            self.log.record(job, "skipped", f"naukri ext link unsupported ATS: {ext_url[:60]}")
-            return
-
+        # _handle_external_apply navigates itself; GenericAtsHandler covers
+        # platforms not yet in _ATS_HANDLER_MAP.
+        print(f"  [Agent3/Naukri] Apply URL ({detect_ats(ext_url) or 'generic'}): {ext_url[:80]}")
         try:
-            page.goto(ext_url, timeout=30000, wait_until="domcontentloaded")
             self._handle_external_apply(page, job, resume_path, ext_url)
         except Exception as exc:
-            print(f"  [Agent3/Naukri] ATS navigate error for {job.company}: {exc}")
+            print(f"  [Agent3/Naukri] ATS apply error for {job.company}: {exc}")
             self.log.record(job, "failed", str(exc)[:100])
 
     def _naukri_api_apply_url(self, job_id: str,
@@ -1437,56 +1583,74 @@ class ApplicationAgent:
     def _handle_external_apply(self, page: Page, job: "JobPosting",
                                 resume_path: Path, external_url: str) -> None:
         ats = detect_ats(external_url)
-        if not ats or ats not in _ATS_HANDLER_MAP:
-            ats_label = ats or "unknown ATS"
-            print(f"  [Agent3] No handler for {ats_label} — skipping {job.company}.")
-            self.log.record(job, "skipped", f"unsupported ATS: {ats_label}")
+        ats_label = ats.title() if ats else "ATS"
+
+        # Use specific handler if available, otherwise fall back to generic
+        handler_class = _ATS_HANDLER_MAP.get(ats, GenericAtsHandler)
+        if ats and ats not in _ATS_HANDLER_MAP:
+            print(f"  [Agent3] Unknown ATS ({ats_label}) — using generic handler for {job.company}")
+
+        print(f"  [Agent3] External apply via {ats_label} → {job.company}")
+
+        # Navigate to the ATS page so we can inspect for a login wall
+        try:
+            page.goto(external_url, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+        except PWTimeout:
+            print(f"  [Agent3] Timeout navigating to {external_url[:70]}")
+            self.log.record(job, "failed", "ATS navigation timeout")
             return
 
-        print(f"  [Agent3] External apply via {ats.title()} → {job.company}")
+        # Decide whether credentials are actually needed by checking the live page
+        in_no_login = ats in _NO_LOGIN_ATS
+        has_login_wall = bool(page.query_selector("input[type='password']"))
+        needs_login = (not in_no_login) and has_login_wall
 
-        # Credentials: not needed for Greenhouse/Lever, required for Workday etc.
         creds = {"username": "", "password": ""}
-        if ats not in _NO_LOGIN_ATS:
-            cred_key_name = f"{ats}_{job.company.lower().replace(' ', '_')[:24]}"
+        if not in_no_login:
+            cred_key_name = f"{(ats or 'generic')}_{job.company.lower().replace(' ', '_')[:24]}"
             try:
                 creds = self.cred_manager.get_site_credentials(cred_key_name, self.cred_key)
+                needs_login = True  # stored creds exist — always try login
             except (KeyError, FileNotFoundError):
-                if not self.telegram:
-                    print(f"  [Agent3] No {ats.title()} credentials and Telegram not set — skipping.")
-                    self.log.record(job, "skipped", f"no {ats} credentials")
-                    return
-                # In CI (non-interactive) skip login-required ATS to avoid hanging
-                # the run on per-job Telegram credential prompts (10 min each).
-                if os.environ.get("CI") == "true":
-                    print(f"  [Agent3] {ats.title()} needs an account; no stored creds (CI) — skipping {job.company}.")
-                    self.log.record(job, "skipped", f"{ats} needs account (no stored creds)")
-                    return
-                creds = self.telegram.request_credentials(
-                    ats, external_url, job, self.creds_request_timeout
-                )
-                if not creds:
-                    self.log.record(job, "skipped", f"user skipped {ats} credentials")
-                    return
-                # Save for future runs
-                self.cred_manager.upsert_credential(cred_key_name, "username", creds["username"], self.cred_key)
-                self.cred_manager.upsert_credential(cred_key_name, "password", creds["password"], self.cred_key)
-                print(f"  [Agent3] {ats.title()} credentials saved for {job.company}")
+                if needs_login:
+                    # Login wall visible but no stored creds — ask user via Telegram
+                    if not self.telegram:
+                        print(f"  [Agent3] Login wall but Telegram not set — skipping.")
+                        self.log.record(job, "skipped", f"no {ats_label} credentials")
+                        return
+                    if os.environ.get("CI") == "true":
+                        print(f"  [Agent3] {ats_label} needs login; no stored creds (CI) — skipping.")
+                        self.log.record(job, "skipped", f"{ats_label} needs account (no stored creds)")
+                        return
+                    creds_result = self.telegram.request_credentials(
+                        ats_label, external_url, job, self.creds_request_timeout
+                    )
+                    if not creds_result:
+                        self.log.record(job, "skipped", f"user skipped {ats_label} credentials")
+                        return
+                    creds = creds_result
+                    self.cred_manager.upsert_credential(
+                        cred_key_name, "username", creds["username"], self.cred_key
+                    )
+                    self.cred_manager.upsert_credential(
+                        cred_key_name, "password", creds["password"], self.cred_key
+                    )
+                    print(f"  [Agent3] {ats_label} credentials saved for {job.company}")
 
-        page.goto(external_url, timeout=30000)
-        ext_handler: BaseApplicationHandler = _ATS_HANDLER_MAP[ats](page)
+        ext_handler: BaseApplicationHandler = handler_class(page)
 
-        if ats not in _NO_LOGIN_ATS:
+        if needs_login and (creds.get("username") or creds.get("password")):
             logged_in = ext_handler.login(creds["username"], creds["password"])
             if not logged_in:
-                print(f"  [Agent3] {ats.title()} login failed for {job.company}.")
-                self.log.record(job, "failed", f"{ats} login failed")
+                print(f"  [Agent3] {ats_label} login failed for {job.company}.")
+                self.log.record(job, "failed", f"{ats_label} login failed")
                 return
 
         success = ext_handler.apply(job, resume_path)
         status = "submitted" if success else "failed"
-        self.log.record(job, status, "" if success else f"{ats} apply error")
-        print(f"  [Agent3] {status.upper()} ({ats.title()}) — {job.company}")
+        self.log.record(job, status, "" if success else f"{ats_label} apply error")
+        print(f"  [Agent3] {status.upper()} ({ats_label}) — {job.company}")
 
     def _handle_captcha(self, job, current_url):
         print(f"  [Agent3] CAPTCHA detected for {job.company}")
