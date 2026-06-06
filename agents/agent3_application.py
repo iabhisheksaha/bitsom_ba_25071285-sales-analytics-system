@@ -718,6 +718,46 @@ class WorkdayHandler(BaseApplicationHandler):
             pass
         return None
 
+    @staticmethod
+    def _react_fill(el, value: str) -> bool:
+        """
+        Fill an input so React registers the change. Workday uses controlled
+        React inputs: a plain .fill() sets the value but onChange may not fire,
+        so the submit button stays disabled / validation thinks it's empty.
+        We focus, set the value via the native setter, then dispatch input+change.
+        """
+        if el is None:
+            return False
+        try:
+            el.click()
+        except Exception:
+            pass
+        try:
+            el.fill("")
+            el.type(value, delay=20)
+        except Exception:
+            try:
+                el.fill(value)
+            except Exception:
+                return False
+        try:
+            el.evaluate(
+                """(node, val) => {
+                    const proto = node.tagName === 'TEXTAREA'
+                        ? window.HTMLTextAreaElement.prototype
+                        : window.HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                    setter.call(node, val);
+                    node.dispatchEvent(new Event('input',  { bubbles: true }));
+                    node.dispatchEvent(new Event('change', { bubbles: true }));
+                    node.dispatchEvent(new Event('blur',   { bubbles: true }));
+                }""",
+                value,
+            )
+        except Exception:
+            pass
+        return True
+
     def _targets(self) -> list:
         """
         All frames across all pages in the browser context - so we can find
@@ -1141,18 +1181,18 @@ class WorkdayHandler(BaseApplicationHandler):
         if not email or not pw:
             print("    [Workday] Could not locate Sign In email/password fields.")
             return
-        try:
-            email.fill(username)
-            pw.fill(password)
-            print("    [Workday] Entered Sign In credentials.")
-        except Exception as exc:
-            print(f"    [Workday] Could not fill Sign In fields: {str(exc)[:70]}")
+        if not self._react_fill(email, username) or not self._react_fill(pw, password):
+            print("    [Workday] Could not fill Sign In fields.")
             return
+        print("    [Workday] Entered Sign In credentials.")
 
         # 3) Click the SIGN IN button only - never Create Account.
-        btn = self._visible("[data-automation-id='signInSubmitButton']")
-        if not btn:
-            # last resort: a Sign In submit button that is not Create Account
+        #    Retry, and verify the step actually advances (React may need the
+        #    onChange events from _react_fill before the button enables).
+        def _find_signin_btn():
+            b = self._visible("[data-automation-id='signInSubmitButton']")
+            if b:
+                return b
             for sel in ["button:has-text('Sign In')", "button[type='submit']"]:
                 cand = self._visible(sel)
                 if cand:
@@ -1161,20 +1201,51 @@ class WorkdayHandler(BaseApplicationHandler):
                             continue
                     except Exception:
                         pass
-                    btn = cand
-                    break
-        if btn:
+                    return cand
+            return None
+
+        for attempt in range(3):
+            btn = _find_signin_btn()
+            if btn:
+                try:
+                    btn.click(timeout=4000)
+                    print(f"    [Workday] Clicked Sign In (attempt {attempt+1}).")
+                except Exception as exc:
+                    if "closed" not in str(exc).lower():
+                        print(f"    [Workday] Sign In click note: {str(exc)[:70]}")
+            else:
+                try:
+                    pw.press("Enter")
+                    print("    [Workday] Pressed Enter to submit sign-in.")
+                except Exception:
+                    pass
+
+            self.page.wait_for_timeout(3500)
             try:
-                btn.click(timeout=4000)
-                print("    [Workday] Clicked Sign In.")
-            except Exception as exc:
-                if "closed" not in str(exc).lower():
-                    print(f"    [Workday] Sign In click note: {str(exc)[:70]}")
-        else:
-            try:
-                pw.press("Enter")
+                self.page.wait_for_load_state("domcontentloaded")
             except Exception:
                 pass
+
+            # Advanced past the sign-in step? email field should be gone.
+            _, _, still_email = self._find_anywhere(self._EMAIL_SEL)
+            if not still_email:
+                print("    [Workday] Sign-in succeeded - past the account step.")
+                return
+
+            # Visible sign-in error?
+            _, _, err = self._find_anywhere(
+                ["[data-automation-id='errorMessage']", "[role='alert']", ".css-error"]
+            )
+            if err:
+                txt = (err.inner_text() or "").strip()[:140]
+                if txt and any(w in txt.lower() for w in
+                               ("incorrect", "invalid", "not match", "error", "try again", "match")):
+                    print(f"    [Workday] Sign-in error: {txt}")
+                    return
+            # else: still on sign-in with no error -> re-fill and retry
+            self._react_fill(email, username)
+            self._react_fill(pw, password)
+        print("    [Workday] Sign-in did not advance after retries.")
 
         self.page.wait_for_timeout(3500)
         try:
