@@ -3,12 +3,12 @@ Agent 1: Job Discovery and Scraping
 Searches LinkedIn, Indeed, and Naukri.com for VP-level Product Owner /
 Business Analyst roles in Pune and returns structured job postings.
 
-Architecture — zero-cost primary sources
+Architecture - zero-cost primary sources
 -----------------------------------------
-Naukri   : Internal JSON API (naukri.com/jobapi/v3/search) — same endpoint
+Naukri   : Internal JSON API (naukri.com/jobapi/v3/search) - same endpoint
            the website calls; returns machine-readable job data directly.
-Indeed   : Official RSS feed (in.indeed.com/rss) — documented, no auth.
-LinkedIn : Guest jobs API (linkedin.com/jobs-guest/…) — no login needed.
+Indeed   : Official RSS feed (in.indeed.com/rss) - documented, no auth.
+LinkedIn : Guest jobs API (linkedin.com/jobs-guest/...) - no login needed.
 
 ScraperAPI is used only as a fallback when a free approach fails AND
 SCRAPER_API_KEY is set in the environment. Removing the key disables it
@@ -29,8 +29,10 @@ from urllib.parse import quote_plus, urlencode
 import requests
 from bs4 import BeautifulSoup
 
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
+SCRAPER_API_KEY      = os.environ.get("SCRAPER_API_KEY", "")
 SCRAPER_API_ENDPOINT = "https://api.scraperapi.com/"
+BROWSER_PROFILE_DIR  = os.environ.get("BROWSER_PROFILE_DIR", "")
+HEADLESS             = os.environ.get("HEADLESS", "true").lower() != "false"
 
 _RENDER_TIMEOUT = 75
 _PLAIN_TIMEOUT  = 45
@@ -41,7 +43,7 @@ _DEFAULT_UA = (
 )
 
 # Headers expected by Naukri's internal JSON API.
-# NOTE: header keys must be exactly "appid" / "systemid" (no hyphen) — the API
+# NOTE: header keys must be exactly "appid" / "systemid" (no hyphen) - the API
 # rejects "system-id" with HTTP 400 "Please provide the valid App Id and SystemId".
 _NAUKRI_API_HEADERS = {
     "appid":         "109",
@@ -70,7 +72,7 @@ class JobPosting:
 
 
 # ---------------------------------------------------------------------------
-# ScraperAPI — kept as optional fallback only (costs credits)
+# ScraperAPI - kept as optional fallback only (costs credits)
 # ---------------------------------------------------------------------------
 
 def scraperapi_fetch(
@@ -117,14 +119,14 @@ def scraperapi_fetch(
                           f"           body: {body}")
                 return resp
             wait = 10 * (attempt + 1)
-            print(f"  [Agent1] ScraperAPI HTTP {resp.status_code} (attempt {attempt+1}/3) — "
-                  f"retrying in {wait}s…")
+            print(f"  [Agent1] ScraperAPI HTTP {resp.status_code} (attempt {attempt+1}/3) - "
+                  f"retrying in {wait}s...")
             time.sleep(wait)
         except requests.RequestException as exc:
             last_exc = exc
             wait = 10 * (attempt + 1)
-            print(f"  [Agent1] ScraperAPI error (attempt {attempt+1}/3): {exc} — "
-                  f"retrying in {wait}s…")
+            print(f"  [Agent1] ScraperAPI error (attempt {attempt+1}/3): {exc} - "
+                  f"retrying in {wait}s...")
             time.sleep(wait)
     print(f"  [Agent1] ScraperAPI retries exhausted for {target_url}"
           + (f": {last_exc}" if last_exc else ""))
@@ -161,7 +163,7 @@ class BaseScraper:
 
 
 # ---------------------------------------------------------------------------
-# Naukri — internal JSON API (free, no ScraperAPI)
+# Naukri - internal JSON API (free, no ScraperAPI)
 # ---------------------------------------------------------------------------
 
 class NaukriScraper(BaseScraper):
@@ -178,25 +180,25 @@ class NaukriScraper(BaseScraper):
                 print(f"  [Agent1/Naukri] API search page {page_no}: '{keyword}' in {location}")
                 jobs = self._api_search(keyword, location, page_no)
                 if jobs:
-                    print(f"  [Agent1/Naukri]   → {len(jobs)} jobs (JSON API)")
+                    print(f"  [Agent1/Naukri]   -> {len(jobs)} jobs (JSON API)")
                     postings.extend(jobs)
                     time.sleep(self.delay)
                     continue
 
-                # API failed — fall back to ScraperAPI render if key is set
+                # API failed - fall back to ScraperAPI render if key is set
                 if SCRAPER_API_KEY:
-                    print(f"  [Agent1/Naukri] API failed — trying ScraperAPI render fallback")
+                    print(f"  [Agent1/Naukri] API failed - trying ScraperAPI render fallback")
                     jobs = self._scraperapi_fallback(keyword, location, page_no)
                     if jobs:
-                        print(f"  [Agent1/Naukri]   → {len(jobs)} jobs (ScraperAPI fallback)")
+                        print(f"  [Agent1/Naukri]   -> {len(jobs)} jobs (ScraperAPI fallback)")
                         postings.extend(jobs)
                 else:
-                    print(f"  [Agent1/Naukri] API failed, no SCRAPER_API_KEY — skipping page.")
+                    print(f"  [Agent1/Naukri] API failed, no SCRAPER_API_KEY - skipping page.")
                 time.sleep(self.delay)
         return postings
 
     def _api_search(self, keyword: str, location: str, page: int) -> list[JobPosting]:
-        """Hit Naukri's internal JSON search API — same endpoint their SPA calls."""
+        """Hit Naukri's internal JSON search API - same endpoint their SPA calls."""
         params = {
             "noOfResults":  20,
             "urlType":      "search_by_key_loc",
@@ -215,7 +217,7 @@ class NaukriScraper(BaseScraper):
                 timeout=20,
             )
             if not resp.ok:
-                print(f"  [Agent1/Naukri] API HTTP {resp.status_code} — {resp.text[:300]}")
+                print(f"  [Agent1/Naukri] API HTTP {resp.status_code} - {resp.text[:300]}")
                 return []
             data = resp.json()
             job_list = data.get("jobDetails") or data.get("jobs") or []
@@ -326,6 +328,70 @@ class NaukriScraper(BaseScraper):
         return results
 
 
+# ---------------------------------------------------------------------------
+# Naukri -- browser-based fallback (uses persistent login session)
+# ---------------------------------------------------------------------------
+
+class NaukriBrowserScraper(BaseScraper):
+    """
+    Falls back to Playwright + the saved browser profile when Naukri's JSON
+    API is CAPTCHA-blocked.  The browser already has a valid Naukri session
+    (set up once via login_setup.py), so no CAPTCHA is triggered.
+    Agent1 opens the browser, extracts jobs, then closes it so agent3 can
+    reuse the same profile later in the same run.
+    """
+    platform = "naukri"
+
+    def scrape(self, roles: list, seniority_keywords: list, location: str) -> list[JobPosting]:
+        if not BROWSER_PROFILE_DIR or not Path(BROWSER_PROFILE_DIR).exists():
+            print("  [Agent1/Naukri/Browser] No browser profile found - skipping.")
+            return []
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            print("  [Agent1/Naukri/Browser] playwright not installed - skipping.")
+            return []
+
+        _parser = NaukriScraper(self.config)
+        postings: list[JobPosting] = []
+
+        with sync_playwright() as pw:
+            ctx = pw.chromium.launch_persistent_context(
+                user_data_dir=BROWSER_PROFILE_DIR,
+                headless=HEADLESS,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                      "--ignore-certificate-errors",
+                      "--disable-blink-features=AutomationControlled"],
+                user_agent=_DEFAULT_UA,
+                viewport={"width": 1366, "height": 768},
+                locale="en-IN",
+                ignore_https_errors=True,
+            )
+            try:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                for role in roles:
+                    keyword = f"{role} {seniority_keywords[0]}"
+                    slug    = re.sub(r"\s+", "-", keyword.lower())
+                    loc     = location.lower()
+                    kw_enc  = quote_plus(keyword)
+                    url     = (f"https://www.naukri.com/{slug}-jobs-in-{loc}"
+                               f"?k={kw_enc}&l={loc}&jobAge=30")
+                    print(f"  [Agent1/Naukri/Browser] {url}")
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=40_000)
+                        page.wait_for_timeout(4_000)
+                        jobs = _parser._extract_html(page.content())
+                        print(f"  [Agent1/Naukri/Browser] -> {len(jobs)} jobs")
+                        postings.extend(jobs)
+                    except Exception as exc:
+                        print(f"  [Agent1/Naukri/Browser] page error: {exc}")
+                    time.sleep(self.delay)
+            finally:
+                ctx.close()
+
+        return postings
+
+
 def _naukri_extract_apply_url(data: dict) -> str:
     """
     Extract an external ATS apply URL from a Naukri job object.
@@ -354,7 +420,7 @@ def _naukri_extract_apply_url(data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Indeed — RSS feed (free, no auth, no ScraperAPI)
+# Indeed - RSS feed (free, no auth, no ScraperAPI)
 # ---------------------------------------------------------------------------
 
 class IndeedScraper(BaseScraper):
@@ -369,14 +435,14 @@ class IndeedScraper(BaseScraper):
             print(f"  [Agent1/Indeed] RSS search: '{query}' in {location}")
             jobs = self._rss_search(query, location)
             if jobs:
-                print(f"  [Agent1/Indeed]   → {len(jobs)} jobs (RSS)")
+                print(f"  [Agent1/Indeed]   -> {len(jobs)} jobs (RSS)")
                 postings.extend(jobs)
                 time.sleep(self.delay)
                 continue
 
-            # RSS failed — try ScraperAPI render if available
+            # RSS failed - try ScraperAPI render if available
             if SCRAPER_API_KEY:
-                print("  [Agent1/Indeed] RSS failed — trying ScraperAPI render fallback")
+                print("  [Agent1/Indeed] RSS failed - trying ScraperAPI render fallback")
                 for p in range(self.max_pages):
                     url = (
                         f"{self.SEARCH_URL}"
@@ -390,11 +456,11 @@ class IndeedScraper(BaseScraper):
                     if not fb_jobs:
                         _debug_dump_html("indeed", resp.text, p + 1)
                         break
-                    print(f"  [Agent1/Indeed]   → {len(fb_jobs)} jobs (ScraperAPI page {p+1})")
+                    print(f"  [Agent1/Indeed]   -> {len(fb_jobs)} jobs (ScraperAPI page {p+1})")
                     postings.extend(fb_jobs)
                     time.sleep(self.delay)
             else:
-                print("  [Agent1/Indeed] RSS failed, no SCRAPER_API_KEY — skipping.")
+                print("  [Agent1/Indeed] RSS failed, no SCRAPER_API_KEY - skipping.")
         return postings
 
     def _rss_search(self, query: str, location: str) -> list[JobPosting]:
@@ -449,7 +515,7 @@ class IndeedScraper(BaseScraper):
             job_loc   = parts[2] if len(parts) > 2 else location
 
             link = link_el.text or "" if link_el is not None else ""
-            # Strip tracking params — keep only the base URL
+            # Strip tracking params - keep only the base URL
             link = link.split("?")[0] if "?" in link else link
 
             desc = ""
@@ -510,7 +576,7 @@ class IndeedScraper(BaseScraper):
 
 
 # ---------------------------------------------------------------------------
-# LinkedIn — public guest jobs API (no login, no ScraperAPI needed)
+# LinkedIn - public guest jobs API (no login, no ScraperAPI needed)
 # ---------------------------------------------------------------------------
 
 class LinkedInScraper(BaseScraper):
@@ -536,7 +602,7 @@ class LinkedInScraper(BaseScraper):
                     if resp is None or resp.status_code != 200:
                         break
                 jobs = self._extract(resp.text, location)
-                print(f"  [Agent1/LinkedIn]   → {len(jobs)} jobs")
+                print(f"  [Agent1/LinkedIn]   -> {len(jobs)} jobs")
                 if not jobs:
                     _debug_dump_html("linkedin", resp.text, p + 1)
                     break
@@ -627,7 +693,7 @@ class JobDiscoveryAgent:
         platforms  = search.get("platforms", {})
 
         mode = "free APIs only (no SCRAPER_API_KEY)" if not SCRAPER_API_KEY else "free APIs + ScraperAPI fallback"
-        print(f"[Agent1] Starting job discovery — roles: {roles}, seniority: {seniority}, "
+        print(f"[Agent1] Starting job discovery - roles: {roles}, seniority: {seniority}, "
               f"location: {location}, mode: {mode}")
 
         all_postings: list[JobPosting] = []
@@ -642,6 +708,14 @@ class JobDiscoveryAgent:
             try:
                 jobs = scraper_cls(self.config).scrape(roles, seniority, location)
                 print(f"  [Agent1] {scraper_cls.__name__} found {len(jobs)} postings")
+                # When Naukri's JSON API is CAPTCHA-blocked, fall back to browser scraping
+                if name == "naukri" and not jobs and BROWSER_PROFILE_DIR:
+                    print("  [Agent1] Naukri API blocked - trying browser scrape via saved session")
+                    try:
+                        jobs = NaukriBrowserScraper(self.config).scrape(roles, seniority, location)
+                        print(f"  [Agent1] NaukriBrowserScraper found {len(jobs)} postings")
+                    except Exception as bexc:
+                        print(f"  [Agent1] Naukri browser fallback error: {bexc}")
                 all_postings.extend(jobs)
             except Exception as exc:
                 import traceback
@@ -649,7 +723,7 @@ class JobDiscoveryAgent:
                 traceback.print_exc()
 
         unique = self._deduplicate(all_postings)
-        print(f"[Agent1] Discovery complete — {len(unique)} unique postings")
+        print(f"[Agent1] Discovery complete - {len(unique)} unique postings")
         return unique
 
     @staticmethod
