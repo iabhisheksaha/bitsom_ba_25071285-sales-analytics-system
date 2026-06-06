@@ -345,6 +345,43 @@ def find_best_option(answer: str, options: list[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Honeypot / bot-trap detection
+# ---------------------------------------------------------------------------
+
+_HONEYPOT_LABEL_RE = re.compile(
+    r"robots?\s+only|do\s+not\s+enter|leave\s+(this\s+)?blank|"
+    r"if\s+you'?re\s+human|bot\s+field",
+    re.IGNORECASE,
+)
+_HONEYPOT_NAME_RE = re.compile(
+    r"beecatcher|honeypot|honey_pot|hpot|bot.?catch|spam.?trap|"
+    r"confirm.?email.?address.?hidden",
+    re.IGNORECASE,
+)
+
+
+def _is_honeypot(el, label: str) -> bool:
+    """
+    Detect anti-bot honeypot fields (e.g. Citi Workday's 'beecatcher' /
+    'This input is for robots only'). Filling these flags us as a bot, so skip.
+    """
+    if label and _HONEYPOT_LABEL_RE.search(label):
+        return True
+    try:
+        for attr in ("name", "id", "data-automation-id", "aria-label"):
+            v = el.get_attribute(attr) or ""
+            if v and _HONEYPOT_NAME_RE.search(v):
+                return True
+        # Visually hidden inputs that still report visible are classic honeypots
+        style = (el.get_attribute("style") or "").replace(" ", "").lower()
+        if "opacity:0" in style or "display:none" in style or "visibility:hidden" in style:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main page filler
 # ---------------------------------------------------------------------------
 
@@ -387,6 +424,10 @@ def fill_page_fields(
                         continue
                 label = _get_element_label(page, el)
                 if not label:
+                    continue
+                if _is_honeypot(el, label):
+                    if verbose:
+                        print(f"    [FormFillerAI] Skipping honeypot field '{label[:40]}'")
                     continue
                 answer = get_preset_answer(label, profile)
                 if answer is None:

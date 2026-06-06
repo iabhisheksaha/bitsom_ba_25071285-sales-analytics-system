@@ -718,6 +718,48 @@ class WorkdayHandler(BaseApplicationHandler):
             pass
         return None
 
+    def _robust_click(self, el, label: str = "") -> bool:
+        """
+        Click an element that may be disabled-looking, covered by an invisible
+        anti-bot layer, or not yet 'actionable'. Tries: normal -> force -> JS click.
+        Returns True if any method dispatched the click.
+        """
+        if el is None:
+            return False
+        try:
+            el.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        # 1. normal (short timeout so we fail fast to the fallbacks)
+        try:
+            el.click(timeout=2500)
+            return True
+        except Exception:
+            pass
+        # 2. force - bypasses actionability/overlay interception
+        try:
+            el.click(timeout=2500, force=True)
+            print(f"    [Workday] {label}: used force-click.")
+            return True
+        except Exception:
+            pass
+        # 3. JS click - bypasses everything Playwright checks
+        try:
+            el.evaluate("b => b.click()")
+            print(f"    [Workday] {label}: used JS click.")
+            return True
+        except Exception:
+            pass
+        try:
+            dis = el.get_attribute("disabled")
+            adis = el.get_attribute("aria-disabled")
+            if dis is not None or adis == "true":
+                print(f"    [Workday] {label} button is disabled "
+                      f"(disabled={dis!r}, aria-disabled={adis!r}).")
+        except Exception:
+            pass
+        return False
+
     @staticmethod
     def _react_fill(el, value: str) -> bool:
         """
@@ -837,17 +879,14 @@ class WorkdayHandler(BaseApplicationHandler):
             self.page.wait_for_timeout(800)
 
             # Already signed in (e.g. via a manual login saved in the profile)?
-            # Apply/wizard controls or a 'Sign Out'/account menu would be visible,
-            # and no email field would be present.
+            # Only TRUE signed-in markers count - a 'Sign Out'/account menu or the
+            # wizard nav. The 'Autofill/Apply Manually' chooser also appears BEFORE
+            # sign-in, so it is NOT a reliable signed-in marker (false positive).
             _, _, _already_email = self._find_anywhere(self._EMAIL_SEL)
             signed_in_markers = [
-                "[data-automation-id='applyButton']",
                 "[data-automation-id='bottom-navigation-next-btn']",
-                "[data-automation-id='autofillWithResume']",
-                "[data-automation-id='applyManually']",
                 "[data-automation-id='utilityButtonSignOut']",
                 "a:has-text('Sign Out')", "button:has-text('Sign Out')",
-                "a:has-text('Apply Manually')", "a:has-text('Autofill with Resume')",
             ]
             if not _already_email:
                 for m in signed_in_markers:
@@ -1207,12 +1246,9 @@ class WorkdayHandler(BaseApplicationHandler):
         for attempt in range(3):
             btn = _find_signin_btn()
             if btn:
-                try:
-                    btn.click(timeout=4000)
-                    print(f"    [Workday] Clicked Sign In (attempt {attempt+1}).")
-                except Exception as exc:
-                    if "closed" not in str(exc).lower():
-                        print(f"    [Workday] Sign In click note: {str(exc)[:70]}")
+                clicked = self._robust_click(btn, "Sign In")
+                print(f"    [Workday] Sign In click attempt {attempt+1}: "
+                      f"{'done' if clicked else 'all click methods failed'}.")
             else:
                 try:
                     pw.press("Enter")
