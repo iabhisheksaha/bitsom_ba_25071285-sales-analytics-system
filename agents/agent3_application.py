@@ -730,6 +730,19 @@ class WorkdayHandler(BaseApplicationHandler):
             el.scroll_into_view_if_needed(timeout=2000)
         except Exception:
             pass
+        # Wait for the element to stop re-rendering (Workday/React re-paints a lot;
+        # clicking mid-render is a common cause of 'intercepts pointer events').
+        # Technique adapted from amgenene/workday_auto's outerHTML stability check.
+        try:
+            prev = None
+            for _ in range(6):
+                cur = el.evaluate("e => e.outerHTML")
+                if cur == prev:
+                    break
+                prev = cur
+                self.page.wait_for_timeout(200)
+        except Exception:
+            pass
         # 1. normal (short timeout so we fail fast to the fallbacks)
         try:
             el.click(timeout=2500)
@@ -1040,12 +1053,13 @@ class WorkdayHandler(BaseApplicationHandler):
         """
         self._dismiss_overlays()
         apply_btn = (
+            self._visible("a[role='button'][data-uxi-element-id='Apply_adventureButton']") or
             self._visible("[data-automation-id='applyButton']") or
             self._visible("a:has-text('Apply')") or
             self._visible("button:has-text('Apply')")
         )
         if apply_btn:
-            apply_btn.click()
+            self._robust_click(apply_btn, "Apply")
             self.page.wait_for_timeout(2500)
 
         # Preferred: 'Apply With LinkedIn' - the persistent profile is already
