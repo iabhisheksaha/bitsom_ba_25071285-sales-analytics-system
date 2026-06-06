@@ -768,11 +768,24 @@ class WorkdayHandler(BaseApplicationHandler):
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2500)
 
-            # Already signed in? Apply wizard / Apply button would be visible.
-            if self._visible("[data-automation-id='applyButton']") or \
-               self._visible("[data-automation-id='bottom-navigation-next-btn']"):
-                print("    [Workday] Candidate account already signed in.")
-                return True
+            # Already signed in (e.g. via a manual login saved in the profile)?
+            # Apply/wizard controls or a 'Sign Out'/account menu would be visible,
+            # and no email field would be present.
+            _, _, _already_email = self._find_anywhere(self._EMAIL_SEL)
+            signed_in_markers = [
+                "[data-automation-id='applyButton']",
+                "[data-automation-id='bottom-navigation-next-btn']",
+                "[data-automation-id='autofillWithResume']",
+                "[data-automation-id='applyManually']",
+                "[data-automation-id='utilityButtonSignOut']",
+                "a:has-text('Sign Out')", "button:has-text('Sign Out')",
+                "a:has-text('Apply Manually')", "a:has-text('Autofill with Resume')",
+            ]
+            if not _already_email:
+                for m in signed_in_markers:
+                    if self._visible(m):
+                        print(f"    [Workday] Already signed in (saw {m}).")
+                        return True
 
             # If no email field is visible yet, click a 'Sign In' link/tab.
             # That click may spawn a popup window - capture it.
