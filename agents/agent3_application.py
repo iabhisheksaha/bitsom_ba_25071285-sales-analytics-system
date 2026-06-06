@@ -752,20 +752,30 @@ class WorkdayHandler(BaseApplicationHandler):
                 self.page.wait_for_timeout(200)
         except Exception:
             pass
-        # 1. normal
+        # 1. normal trusted click
         try:
             el.click(timeout=2500)
             return True
         except Exception:
             pass
-        # 2. JS click - directly fires the handler, bypassing any covering overlay
+        # 2. TRUSTED coordinate click: neutralise any overlay covering the button's
+        #    centre (set pointer-events:none on covering nodes), then a real
+        #    page.mouse click at those coords. This yields event.isTrusted=true,
+        #    which anti-bot handlers (Citi) require - a JS .click() is isTrusted=false
+        #    and gets ignored. Defeats the overlay-blocks-trusted / js-not-trusted trap.
+        try:
+            if self._trusted_coordinate_click(el, label):
+                return True
+        except Exception:
+            pass
+        # 3. JS click - fires the handler directly (works where isTrusted is not checked)
         try:
             el.evaluate("b => b.click()")
             print(f"    [Workday] {label}: used JS click.")
             return True
         except Exception:
             pass
-        # 3. force click - last resort (may hit an overlay instead of the element)
+        # 4. force click - last resort (may hit an overlay instead of the element)
         try:
             el.click(timeout=2500, force=True)
             print(f"    [Workday] {label}: used force-click (last resort).")
@@ -781,6 +791,55 @@ class WorkdayHandler(BaseApplicationHandler):
         except Exception:
             pass
         return False
+
+    def _trusted_coordinate_click(self, el, label: str = "") -> bool:
+        """
+        Produce a TRUSTED click (event.isTrusted == true) even when an invisible
+        overlay covers the button:
+          1. compute the button's centre point
+          2. for every element stacked above the button at that point, set
+             pointer-events:none so the real mouse event reaches the button
+          3. dispatch a real page.mouse.click at the centre (trusted event)
+        Only works for elements on the top-level page (not cross-origin frames).
+        """
+        try:
+            box = el.bounding_box()
+        except Exception:
+            box = None
+        if not box or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
+            return False
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        # Neutralise covering overlays at the button centre (skip the button,
+        # its ancestors and its descendants so we don't disable the target).
+        try:
+            self.page.evaluate(
+                """([x, y]) => {
+                    const stack = document.elementsFromPoint(x, y);
+                    if (!stack.length) return;
+                    // pick the actual clickable target in the stack
+                    let btn = stack.find(e =>
+                        e.tagName === 'BUTTON' ||
+                        e.getAttribute('role') === 'button' ||
+                        e.type === 'submit' ||
+                        (e.getAttribute('data-automation-id') || '').toLowerCase().includes('signin')
+                    );
+                    if (!btn) return;
+                    for (const e of stack) {
+                        if (e === btn || btn.contains(e) || e.contains(btn)) continue;
+                        e.style.pointerEvents = 'none';
+                    }
+                }""",
+                [cx, cy],
+            )
+        except Exception:
+            pass
+        try:
+            self.page.mouse.click(cx, cy)
+            print(f"    [Workday] {label}: used trusted coordinate click.")
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _react_fill(el, value: str) -> bool:

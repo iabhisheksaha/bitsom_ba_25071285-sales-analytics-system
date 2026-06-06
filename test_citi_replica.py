@@ -34,7 +34,7 @@ from agents.agent3_application import WorkdayHandler, CHROMIUM_BIN
 PORT = 18094
 STATE = {
     "cookie_dismissed": False, "signed_in": False, "account_created": False,
-    "submitted": False, "beecatcher": "", "step": 0,
+    "submitted": False, "beecatcher": "", "step": 0, "untrusted_attempts": 0,
 }
 
 # An invisible full-screen overlay that intercepts pointer events - this is what
@@ -71,8 +71,10 @@ def page_signin():
           <!-- HONEYPOT: must never be filled -->
           <input type="text" name="beecatcher"
                  aria-label="Enter website. This input is for robots only, do not enter if you're human."/>
+          <!-- ANTI-BOT: only a TRUSTED click authenticates. A JS .click()
+               (event.isTrusted=false) is ignored, exactly like real Citi. -->
           <button type="button" data-automation-id="signInSubmitButton"
-            onclick="fetch('/ev?signin=1').then(()=>window.location='/wizard')">Sign In</button>
+            onclick="if(event.isTrusted){{fetch('/ev?signin=1').then(()=>window.location='/wizard')}}else{{fetch('/ev?untrusted=1')}}">Sign In</button>
         </form>
         <h3>Create Account</h3>
         <form>
@@ -145,6 +147,7 @@ class Mock(BaseHTTPRequestHandler):
             if "signin=1" in q: STATE["signed_in"] = True
             if "create=1" in q: STATE["account_created"] = True
             if "submit=1" in q: STATE["submitted"] = True
+            if "untrusted=1" in q: STATE["untrusted_attempts"] += 1
             if "bee=" in q: STATE["beecatcher"] = q.split("bee=", 1)[1]
             self._send("ok"); return
         if p == "/signin":
@@ -194,10 +197,11 @@ def main():
     print("\n== Results vs the real Citi obstacles ==")
     checks = [
         ("Cookie banner dismissed",          STATE["cookie_dismissed"]),
-        ("Signed in (not account-created)",   STATE["signed_in"] and not STATE["account_created"]),
+        ("Signed in via TRUSTED click",       STATE["signed_in"] and not STATE["account_created"]),
         ("Honeypot 'beecatcher' left empty",  STATE["beecatcher"] == ""),
         ("Reached real Submit",               STATE["submitted"]),
     ]
+    print(f"  (untrusted JS-click attempts Citi would have ignored: {STATE['untrusted_attempts']})")
     ok = True
     for name, passed in checks:
         print(f"  [{'PASS' if passed else 'FAIL'}] {name}")
