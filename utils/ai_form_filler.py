@@ -25,6 +25,10 @@ _PRESET_PATTERNS: list[tuple[str, str]] = [
     (r"work.{0,20}authoriz|authoriz.{0,20}work|right.{0,12}work|eligible.{0,12}work|"
      r"legally.{0,20}work|permit.{0,12}work|work.{0,12}permit", "Yes"),
     (r"sponsor", "No"),  # any sponsorship/visa-sponsorship question -> No (Indian citizen in India)
+    # Previously employed by / related to an employee of the hiring company -> No
+    (r"ever been employed|previously.{0,12}employ|former.{0,10}employee|"
+     r"currently employed by|employed by (citi|the company|this company)|"
+     r"relative.{0,15}employ|related to.{0,20}employee|family member.{0,20}employ", "No"),
     (r"criminal|felony|convicted|arrest", "No"),
     (r"non.?compet|non.?disclosure|nda", "Yes"),
     (r"total.{0,8}years?.{0,12}exp|years?.{0,12}total.{0,12}exp", "12"),
