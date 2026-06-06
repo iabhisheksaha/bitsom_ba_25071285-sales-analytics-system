@@ -43,7 +43,7 @@ applicant:
   name: "Abhishek Saha"
   email: "abhisheksaha@live.com"
   phone: "+91 8956666903"
-  linkedin_url: ""   # e.g. "https://www.linkedin.com/in/abhisheksaha"
+  linkedin_url: "https://www.linkedin.com/in/itsabhisheksaha/"
   location: "Pune, Maharashtra, India"
 
 application:
