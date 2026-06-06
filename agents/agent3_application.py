@@ -787,6 +787,9 @@ class WorkdayHandler(BaseApplicationHandler):
         banner, with a 'Start Your Application' chooser overlaid. We dismiss the
         cookie banner first, then search every page+frame for the credentials.
         """
+        # Remember creds so apply()'s 'Create Account/Sign In' wizard step can reuse them
+        self._login_user = username
+        self._login_pass = password
         try:
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2500)
@@ -960,6 +963,11 @@ class WorkdayHandler(BaseApplicationHandler):
             apply_btn.click()
             self.page.wait_for_timeout(2500)
 
+        # Preferred: 'Apply With LinkedIn' - the persistent profile is already
+        # logged into LinkedIn, so OAuth auto-authorises (at most one 'Allow').
+        if self._try_apply_with_linkedin():
+            return
+
         # 'Start Your Application' chooser
         autofill = (
             self._visible("[data-automation-id='autofillWithResume']") or
@@ -988,30 +996,202 @@ class WorkdayHandler(BaseApplicationHandler):
             apply_manually.click()
             self.page.wait_for_timeout(2000)
 
+    def _try_apply_with_linkedin(self) -> bool:
+        """
+        Click 'Apply With LinkedIn' if present. The persistent browser profile is
+        already logged into LinkedIn, so the OAuth either auto-completes or needs
+        a single 'Allow' click (which may happen in a popup window).
+        Returns True if the LinkedIn path was taken.
+        """
+        btn = (
+            self._visible("[data-automation-id='applyWithLinkedIn']") or
+            self._visible("a:has-text('Apply With LinkedIn')") or
+            self._visible("button:has-text('Apply With LinkedIn')") or
+            self._visible("a:has-text('Apply with LinkedIn')") or
+            self._visible("button:has-text('Apply with LinkedIn')")
+        )
+        if not btn:
+            return False
+        print("    [Workday] Choosing 'Apply With LinkedIn' (profile already logged in).")
+        try:
+            # OAuth may open a popup
+            try:
+                with self.page.context.expect_page(timeout=6000) as pinfo:
+                    btn.click()
+                oauth = pinfo.value
+                oauth.wait_for_load_state("domcontentloaded")
+                oauth.wait_for_timeout(2000)
+                # Click LinkedIn 'Allow'/'Sign in' if shown
+                for sel in ["button:has-text('Allow')", "button[type='submit']",
+                            "button:has-text('Sign in')", "[data-automation-id='allowButton']"]:
+                    try:
+                        el = oauth.query_selector(sel)
+                        if el and el.is_visible():
+                            try:
+                                el.click(timeout=4000)
+                            except Exception:
+                                pass
+                            break
+                    except Exception:
+                        pass
+                oauth.wait_for_timeout(2500)
+            except Exception:
+                # No popup - OAuth happened inline (same page redirect)
+                self.page.wait_for_timeout(3000)
+                for sel in ["button:has-text('Allow')", "button:has-text('Sign in')"]:
+                    el = self._visible(sel)
+                    if el:
+                        try:
+                            el.click(timeout=4000)
+                        except Exception:
+                            pass
+                        break
+            try:
+                self.page.bring_to_front()
+            except Exception:
+                pass
+            self.page.wait_for_timeout(2500)
+            try:
+                self.page.wait_for_load_state("domcontentloaded")
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            print(f"    [Workday] LinkedIn apply note: {str(exc)[:80]}")
+            return True  # we did take the LinkedIn branch even if a sub-step hiccuped
+
+    def _wait_for_step_content(self, tries: int = 8) -> bool:
+        """
+        Workday renders each wizard step's content via React after a delay
+        (a 3-dot spinner). Wait until form inputs or a nav button appear.
+        """
+        for _ in range(tries):
+            try:
+                has_inputs = self.page.query_selector(
+                    "input:not([type='hidden']), select, textarea, "
+                    "[data-automation-id='bottom-navigation-next-btn'], "
+                    "[data-automation-id='submitButton']"
+                )
+                if has_inputs:
+                    return True
+            except Exception:
+                pass
+            self.page.wait_for_timeout(1200)
+        return False
+
+    def _handle_account_step(self, username: str, password: str) -> None:
+        """
+        Workday's 'Apply Manually' flow opens with a 'Create Account/Sign In'
+        wizard step. If we already have a Citi account, switch to Sign In and
+        enter credentials; otherwise create the account (email + password +
+        verify password + agree checkbox).
+        """
+        # Heading check - only act if this looks like the account step
+        try:
+            body = (self.page.inner_text("body") or "").lower()
+        except Exception:
+            body = ""
+        if "create account" not in body and "sign in" not in body:
+            return
+        if not username:
+            return
+
+        # Prefer signing in: click a 'Sign In' toggle/link if present
+        for sel in ["a:has-text('Sign In')", "button:has-text('Sign In')",
+                    "[data-automation-id='signInLink']", "[data-automation-id='backToSignIn']"]:
+            el = self._visible(sel)
+            if el:
+                try:
+                    el.click()
+                    self.page.wait_for_timeout(1500)
+                    break
+                except Exception:
+                    pass
+
+        epg, efr, email = self._find_anywhere(self._EMAIL_SEL)
+        if not email:
+            return
+        try:
+            email.fill(username)
+        except Exception:
+            return
+        _, _, pw = self._find_anywhere(self._PW_SEL)
+        if pw:
+            try:
+                pw.fill(password)
+            except Exception:
+                pass
+        # Verify-password field => we're in Create Account mode
+        verify = self._visible("[data-automation-id='verifyPassword'], "
+                               "input[autocomplete='new-password']:not([data-automation-id='password'])")
+        if verify:
+            try:
+                verify.fill(password)
+            except Exception:
+                pass
+            agree = self._visible("input[type='checkbox']")
+            if agree:
+                try:
+                    agree.check()
+                except Exception:
+                    pass
+        # Submit the account step
+        for sel in self._SUBMIT_SEL + ["[data-automation-id='createAccountSubmitButton']",
+                                       "button:has-text('Create Account')", "button:has-text('Continue')"]:
+            btn = self._visible(sel)
+            if btn:
+                try:
+                    btn.click(timeout=4000)
+                except Exception:
+                    pass
+                break
+        self.page.wait_for_timeout(3500)
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+        except Exception:
+            pass
+
     def apply(self, job: JobPosting, resume_path: Path) -> bool:
         profile = _load_applicant_profile()
         resume_text = extract_resume_text(resume_path)
+        username = getattr(self, "_login_user", "") or ""
+        password = getattr(self, "_login_pass", "") or ""
 
         try:
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(2000)
+            self._dismiss_overlays()
 
             self._start_application(resume_path)
 
-            for step in range(15):
+            # If the wizard opens on a Create Account/Sign In step, handle it
+            self._wait_for_step_content()
+            self._handle_account_step(username, password)
+
+            last_progress = ""
+            for step in range(18):
+                self._wait_for_step_content()
+                self._dismiss_overlays()
+
                 # Upload resume on any step that exposes a visible file input
                 upload = self._visible("input[type='file']")
                 if upload:
                     try:
                         upload.set_input_files(str(resume_path.absolute()))
-                        self.page.wait_for_timeout(1200)
+                        self.page.wait_for_timeout(1500)
                     except Exception:
                         pass
 
                 # AI-fill all visible fields on this wizard step
                 filled = fill_page_fields(self.page, profile, resume_text)
                 radios = fill_radio_groups(self.page, profile, resume_text)
-                print(f"    [Workday] Step {step+1}: filled {filled} fields, {radios} radio groups.")
+                # Current step heading (for logging / stall detection)
+                try:
+                    head = self.page.query_selector("[data-automation-id='pageHeader'], h1, h2")
+                    head_txt = (head.inner_text().strip()[:40] if head else "")
+                except Exception:
+                    head_txt = ""
+                print(f"    [Workday] Step {step+1} [{head_txt}]: filled {filled} fields, {radios} radios.")
                 self.page.wait_for_timeout(600)
 
                 submit = self._visible(
@@ -1028,7 +1208,7 @@ class WorkdayHandler(BaseApplicationHandler):
 
                 if submit:
                     submit.click()
-                    self.page.wait_for_timeout(3000)
+                    self.page.wait_for_timeout(3500)
                     print("    [Workday] Submit clicked.")
                     return True
                 elif done:
@@ -1037,11 +1217,26 @@ class WorkdayHandler(BaseApplicationHandler):
                     return True
                 elif nxt:
                     nxt.click()
-                    self.page.wait_for_timeout(1800)
-                    self.page.wait_for_load_state("domcontentloaded")
+                    self.page.wait_for_timeout(2200)
+                    try:
+                        self.page.wait_for_load_state("domcontentloaded")
+                    except Exception:
+                        pass
+                    # Stall detection: if heading didn't change and nothing filled,
+                    # surface a validation error rather than loop pointlessly.
+                    if head_txt and head_txt == last_progress and filled == 0 and radios == 0:
+                        _, _, verr = self._find_anywhere(
+                            ["[data-automation-id='errorMessage']", "[role='alert']", ".css-error"]
+                        )
+                        if verr:
+                            print(f"    [Workday] Validation blocking step '{head_txt}': "
+                                  f"{(verr.inner_text() or '').strip()[:90]}")
+                            return False
+                    last_progress = head_txt
                 else:
-                    print(f"    [Workday] No Next/Submit on step {step+1} - stopping.")
-                    break
+                    print(f"    [Workday] No Next/Submit on step {step+1} [{head_txt}] - stopping.")
+                    self._dump_targets(f"stuck on step '{head_txt}'")
+                    return False
             print("    [Workday] Reached step limit without a Submit button.")
             return False
         except PWTimeout as exc:
