@@ -1,11 +1,16 @@
 """
-AI-powered form filling for job application ATS systems.
+AI-powered form filling for ATS pages (Workday, Greenhouse, Lever, etc.).
 
-Approach sourced from:
-- AIHawk: field-type routing, option fuzzy-matching (Levenshtein)
-- srikar-kodakandla/linkedin-easyapply-using-AI: LinkedIn selectors, two-stage prompting
-- ApplyPilot: profile.json pre-stored answer structure
-- proficiently-claude-skills: Lever /apply trick, Greenhouse iframe extraction
+Three-tier answer strategy:
+  1. Honeypot detection  — skip bot-trap fields silently
+  2. Preset patterns     — fast lookup for common questions (work auth, sponsorship…)
+  3. LLM Council         — multi-model deliberation for complex/unknown questions
+
+Public API:
+    fill_page_fields(page, profile, resume_text)  -> int  (fields filled)
+    fill_radio_groups(page, profile, resume_text) -> int  (groups filled)
+    load_applicant_profile(config_path)           -> dict
+    extract_resume_text(resume_path)              -> str
 """
 
 import os
@@ -13,86 +18,43 @@ import re
 from pathlib import Path
 from typing import Optional
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-_MODEL = "claude-haiku-4-5-20251001"
-
 # ---------------------------------------------------------------------------
-# Preset patterns for common screening questions
-# Checked first to avoid unnecessary API calls.
+# Applicant profile loader
 # ---------------------------------------------------------------------------
 
-_PRESET_PATTERNS: list[tuple[str, str]] = [
-    (r"work.{0,20}authoriz|authoriz.{0,20}work|right.{0,12}work|eligible.{0,12}work|"
-     r"legally.{0,20}work|permit.{0,12}work|work.{0,12}permit", "Yes"),
-    (r"sponsor", "No"),  # any sponsorship/visa-sponsorship question -> No (Indian citizen in India)
-    # Previously employed by / related to an employee of the hiring company -> No
-    (r"ever been employed|previously.{0,12}employ|former.{0,10}employee|"
-     r"currently employed by|employed by (citi|the company|this company)|"
-     r"relative.{0,15}employ|related to.{0,20}employee|family member.{0,20}employ", "No"),
-    (r"criminal|felony|convicted|arrest", "No"),
-    (r"non.?compet|non.?disclosure|nda", "Yes"),
-    (r"total.{0,8}years?.{0,12}exp|years?.{0,12}total.{0,12}exp", "12"),
-    (r"years?.{0,12}product.{0,12}(management|manager|owner)", "10"),
-    (r"years?.{0,12}(business.?analys|ba.?experience)", "12"),
-    (r"years?.{0,12}experience|experience.{0,12}years?", "12"),
-    (r"current.{0,12}(ctc|salary|compens|package)", "20 LPA"),
-    (r"expect.{0,12}(ctc|salary|compens|package)|salary.{0,12}expect", "30 LPA"),
-    (r"desired.{0,12}salary|salary.{0,12}desired", "30 LPA"),
-    (r"notice.{0,12}period|serving.{0,6}notice|available.{0,8}(join|start)", "60 days"),
-    (r"relocat", "Yes"),
-    (r"travel.{0,12}(willing|required|percent|up to)", "Yes, up to 25%"),
-    (r"remote.{0,12}work|work.{0,12}remote", "Hybrid"),
-    (r"veteran|military.{0,8}service", "I am not a protected veteran"),
-    (r"disabilit", "I choose not to self-identify"),
-    (r"^gender$|gender.{0,6}(identif|pronoun)", "Male"),
-    (r"ethnicity|race|national.{0,6}origin", "Asian"),
-]
+_PROFILE_CACHE: "dict | None" = None
 
 
-def load_applicant_profile(
-    config_path: str = "config/config.yaml",
-    answers_path: str = "config/applicant_answers.yaml",
-) -> dict:
-    """Load applicant details from config files into a flat dict."""
-    import yaml
-
-    profile: dict = {}
-
+def load_applicant_profile(config_path: str = "config/config.yaml") -> dict:
+    global _PROFILE_CACHE
+    if _PROFILE_CACHE is not None:
+        return _PROFILE_CACHE
     try:
+        import yaml
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
         raw = cfg.get("applicant", {})
         name = raw.get("name", "")
         parts = name.split(" ", 1)
-        profile.update(
-            {
-                "name": name,
-                "first_name": parts[0] if parts else "",
-                "last_name": parts[1] if len(parts) > 1 else "",
-                "email": raw.get("email", ""),
-                "phone": raw.get("phone", ""),
-                "linkedin_url": raw.get("linkedin_url", ""),
-                "location": raw.get("location", "Pune, Maharashtra, India"),
-            }
-        )
+        _PROFILE_CACHE = {
+            "name":         name,
+            "first_name":   parts[0] if parts else "",
+            "last_name":    parts[1] if len(parts) > 1 else "",
+            "email":        raw.get("email", ""),
+            "phone":        raw.get("phone", ""),
+            "linkedin_url": raw.get("linkedin_url", ""),
+            "location":     raw.get("location", ""),
+            "city":         raw.get("location", "").split(",")[0].strip(),
+        }
     except Exception:
-        pass
-
-    try:
-        with open(answers_path) as f:
-            extra = yaml.safe_load(f) or {}
-        profile.update(extra)
-    except Exception:
-        pass
-
-    return profile
+        _PROFILE_CACHE = {}
+    return _PROFILE_CACHE
 
 
 def extract_resume_text(resume_path: Path) -> str:
-    """Return plain text from a .docx resume for use as AI context."""
+    """Return plain text from a .docx resume for AI context."""
     try:
         from docx import Document
-
         doc = Document(str(resume_path))
         return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
     except Exception:
@@ -100,74 +62,173 @@ def extract_resume_text(resume_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Honeypot detection
+# ---------------------------------------------------------------------------
+
+_HONEYPOT_LABEL_RE = re.compile(
+    r"robots?\s+only|do\s+not\s+(enter|fill)|if\s+you('re|\s+are)\s+human|"
+    r"leave\s+(this|it)\s+blank|not\s+for\s+humans",
+    re.IGNORECASE,
+)
+_HONEYPOT_NAME_RE = re.compile(
+    r"beecatcher|honeypot|bot.?trap|spam.?check|h_?field",
+    re.IGNORECASE,
+)
+
+
+def _is_honeypot(el, label: str) -> bool:
+    if _HONEYPOT_LABEL_RE.search(label):
+        return True
+    try:
+        name = el.get_attribute("name") or ""
+        if _HONEYPOT_NAME_RE.search(name):
+            return True
+        style = el.get_attribute("style") or ""
+        if re.search(r"display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0", style, re.I):
+            return True
+        pos_left = re.search(r"left\s*:\s*-\d{3,}", style)
+        if pos_left:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Preset patterns (fast lookup — no API call needed)
+# ---------------------------------------------------------------------------
+
+# (regex, answer_or_callable)
+_PRESET_PATTERNS: "list[tuple[re.Pattern, object]]" = [
+    # Personal info — from profile
+    (re.compile(r"\bfirst\s*name\b", re.I),    lambda p, _: p.get("first_name", "")),
+    (re.compile(r"\blast\s*name\b|\bsurname\b", re.I), lambda p, _: p.get("last_name", "")),
+    (re.compile(r"\bfull\s*name\b|\bname\b",   re.I),  lambda p, _: p.get("name", "")),
+    (re.compile(r"\be.?mail\b",                re.I),  lambda p, _: p.get("email", "")),
+    (re.compile(r"\bphone|mobile|telephone\b", re.I),  lambda p, _: p.get("phone", "")),
+    (re.compile(r"\blinkedin\b",               re.I),  lambda p, _: p.get("linkedin_url", "")),
+    (re.compile(r"\bcity|current\s*location\b",re.I),  lambda p, _: p.get("city", "")),
+    (re.compile(r"\blocation\b",               re.I),  lambda p, _: p.get("location", "")),
+
+    # Work authorization / legal eligibility
+    (re.compile(
+        r"work.{0,20}authoriz|authoriz.{0,20}work|right.{0,12}work|"
+        r"legally.{0,20}(eligible|authoriz)|eligible.{0,12}work|"
+        r"permitted.{0,12}work|citizen|permanent\s+resident",
+        re.I), "Yes"),
+
+    # Sponsorship
+    (re.compile(r"sponsor(ship)?|require.{0,15}sponsor|visa\s+sponsor", re.I), "No"),
+
+    # Previously employed / family member of employee
+    (re.compile(
+        r"ever\s+been\s+employed|previously.{0,12}employ|former.{0,12}employ|"
+        r"currently\s+employed\s+by|employed\s+by\s+(citi|the\s+company)|"
+        r"relative|related\s+to.{0,20}employee|family\s+member.{0,20}employ",
+        re.I), "No"),
+
+    # Criminal / background
+    (re.compile(r"criminal|felony|convicted|arrest", re.I), "No"),
+
+    # Experience years
+    (re.compile(r"total.{0,8}years?.{0,12}exp|years?.{0,12}total.{0,12}exp", re.I), "12"),
+    (re.compile(r"years?.{0,12}(product.{0,12}(management|manager|owner))", re.I), "10"),
+    (re.compile(r"years?.{0,12}(business.?analys|ba\s+experience)", re.I), "12"),
+    (re.compile(r"years?\s+of\s+experience|experience.{0,8}years?", re.I), "12"),
+
+    # Salary
+    (re.compile(r"current.{0,12}(ctc|salary|compensation|package)", re.I), "20 LPA"),
+    (re.compile(r"expect.{0,12}(ctc|salary|compensation)|salary.{0,12}expect", re.I), "30 LPA"),
+
+    # Notice period
+    (re.compile(r"notice.{0,12}period|serving.{0,6}notice|available.{0,8}(join|start)", re.I), "30 days"),
+
+    # Relocation / travel
+    (re.compile(r"\brelocat\b", re.I), "Yes"),
+    (re.compile(r"travel.{0,12}(willing|required|percent)", re.I), "Yes, up to 25%"),
+
+    # DEI / voluntary disclosures
+    (re.compile(r"\bveteran\b|military.{0,8}service", re.I), "I am not a protected veteran"),
+    (re.compile(r"\bdisabilit\b", re.I), "I choose not to self-identify"),
+    (re.compile(r"^gender$|gender.{0,6}(identif|pronoun)", re.I), "Male"),
+    (re.compile(r"ethnicity|race|national.{0,6}origin", re.I), "Asian"),
+]
+
+
+def _preset_answer(label: str, profile: dict, resume_text: str = "") -> Optional[str]:
+    for pattern, answer in _PRESET_PATTERNS:
+        if pattern.search(label):
+            val = answer(profile, resume_text) if callable(answer) else answer
+            return val or None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Label extraction
 # ---------------------------------------------------------------------------
 
-def _get_element_label(page, element) -> str:
-    """Extract the human-readable label for a form input element."""
+def _get_label(page, el) -> str:
+    """Best-effort label extraction for a form element."""
     # 1. aria-label
     try:
-        v = element.get_attribute("aria-label") or ""
-        if v and len(v) < 120:
+        v = el.get_attribute("aria-label") or ""
+        if v and len(v) < 140:
             return v.strip().rstrip("*").strip()
     except Exception:
         pass
 
-    # 2. aria-labelledby → referenced element text
+    # 2. aria-labelledby
     try:
-        ref_id = element.get_attribute("aria-labelledby") or ""
+        ref_id = el.get_attribute("aria-labelledby") or ""
         if ref_id:
             ref = page.query_selector(f"#{ref_id.split()[0]}")
             if ref:
-                txt = ref.inner_text().strip().rstrip("*").strip()
-                if txt:
-                    return txt
+                t = ref.inner_text().strip().rstrip("*").strip()
+                if t:
+                    return t
     except Exception:
         pass
 
     # 3. <label for="id">
     try:
-        el_id = element.get_attribute("id") or ""
+        el_id = el.get_attribute("id") or ""
         if el_id:
             lbl = page.query_selector(f'label[for="{el_id}"]')
             if lbl:
-                txt = lbl.inner_text().strip().rstrip("*").strip()
-                if txt:
-                    return txt
+                t = lbl.inner_text().strip().rstrip("*").strip()
+                if t:
+                    return t
     except Exception:
         pass
 
-    # 4. Closest label ancestor / container label
+    # 4. Closest label ancestor
     try:
-        txt = element.evaluate(
-            """el => {
-                const lbl = el.closest('label');
-                if (lbl) return lbl.innerText;
-                const wrap = el.closest('.artdeco-text-input--container, .fb-dash-form-element, '
-                           + '[data-test-form-builder-text-input], .jobs-easy-apply-form-element');
-                if (wrap) {
-                    const l = wrap.querySelector('label');
-                    if (l) return l.innerText;
-                }
-                return '';
-            }"""
-        )
-        if txt and len(txt) < 120:
-            return txt.strip().rstrip("*").strip()
+        t = el.evaluate("""el => {
+            const lbl = el.closest('label');
+            if (lbl) return lbl.innerText.trim();
+            const wrap = el.closest('[data-automation-id], .form-field, .field-wrapper');
+            if (wrap) {
+                const l = wrap.querySelector('label');
+                if (l) return l.innerText.trim();
+            }
+            return '';
+        }""")
+        if t and len(t) < 140:
+            return t.rstrip("*").strip()
     except Exception:
         pass
 
     # 5. placeholder
     try:
-        v = element.get_attribute("placeholder") or ""
-        if v and len(v) < 80:
-            return v.strip()
+        ph = el.get_attribute("placeholder") or ""
+        if ph and len(ph) < 80:
+            return ph.strip()
     except Exception:
         pass
 
-    # 6. name attribute (convert to words)
+    # 6. name attribute
     try:
-        name = element.get_attribute("name") or ""
+        name = el.get_attribute("name") or ""
         if name:
             return re.sub(r"[_\-]", " ", name).strip()
     except Exception:
@@ -177,419 +238,269 @@ def _get_element_label(page, element) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Preset answer lookup
+# React-aware fill helper
 # ---------------------------------------------------------------------------
 
-_PROFILE_FIELD_PATTERNS: list[tuple[str, str]] = [
-    (r"first.?name", "first_name"),
-    (r"last.?name|surname|family.?name", "last_name"),
-    (r"^(full.?)?name$", "name"),
-    (r"e.?mail|email.?address", "email"),
-    (r"phone|mobile|telephone|cell", "phone"),
-    (r"linkedin", "linkedin_url"),
-    (r"city|current.{0,8}(city|location)|location", "city"),
-    (r"state|province", "state"),
-    (r"country", "country"),
-    (r"zip|postal.?code", "zip_code"),
-    (r"website|portfolio|personal.{0,8}url", "website_url"),
-    (r"github", "github_url"),
-    (r"university|school|college|institution", "university"),
-    (r"graduation.{0,8}year|year.{0,8}graduate", "graduation_year"),
-    (r"degree|highest.{0,8}(education|qualif)", "highest_education"),
-    (r"current.{0,8}(role|title|position)|job.{0,8}title", "current_role"),
-    (r"current.{0,8}(company|employer|organization)", "current_company"),
-    (r"notice.{0,12}period|serving.{0,6}notice|available.{0,8}(join|start)", "notice_period"),
-    (r"years?.{0,12}experience", "years_of_experience"),
-    (r"expected.{0,12}(ctc|salary|compens)|salary.{0,12}expect|desired.{0,12}salary", "expected_ctc"),
-    (r"current.{0,12}(ctc|salary|compens)", "current_ctc"),
+def _react_fill(page, el, value: str) -> None:
+    """Fill a React-controlled input: native setter + synthetic events."""
+    page.evaluate("""([el, val]) => {
+        const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value').set
+            || Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype, 'value').set;
+        if (setter) setter.call(el, val);
+        el.dispatchEvent(new Event('input',  {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        el.dispatchEvent(new Event('blur',   {bubbles: true}));
+    }""", [el, value])
+
+
+# ---------------------------------------------------------------------------
+# Council-powered AI fallback
+# ---------------------------------------------------------------------------
+
+def _council_answer(label: str, field_type: str,
+                    profile: dict, resume_text: str) -> str:
+    """Use the LLM Council (or single-model fallback) to answer an unknown field."""
+    try:
+        from utils.llm_council import ask_council_brief
+    except ImportError:
+        return _single_model_answer(label, field_type, profile, resume_text)
+
+    system = (
+        "You are filling a job application form. Reply with ONLY the value to "
+        "enter in the field — no explanation, no quotes, no markdown."
+    )
+    question = (
+        f"Job application field label: \"{label}\"\n"
+        f"Field type: {field_type}\n\n"
+        f"Applicant profile:\n"
+        f"  Name: {profile.get('name', '')}\n"
+        f"  Email: {profile.get('email', '')}\n"
+        f"  Phone: {profile.get('phone', '')}\n"
+        f"  Location: {profile.get('location', '')}\n"
+        f"  LinkedIn: {profile.get('linkedin_url', '')}\n\n"
+        f"Resume excerpt (first 600 chars):\n{resume_text[:600]}\n\n"
+        f"What should be entered in this field?"
+    )
+    return ask_council_brief(question, system=system, max_tokens=64)
+
+
+def _single_model_answer(label: str, field_type: str,
+                         profile: dict, resume_text: str) -> str:
+    """Single Claude Haiku call when council not available."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return ""
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        prompt = (
+            f'Fill this job application field.\nLabel: "{label}"\nType: {field_type}\n'
+            f"Profile: {profile}\nResume: {resume_text[:400]}\n"
+            f"Reply with ONLY the value, nothing else."
+        )
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=64,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Radio group handling
+# ---------------------------------------------------------------------------
+
+_RADIO_PRESET: "list[tuple[re.Pattern, str]]" = [
+    (re.compile(r"work.{0,20}authoriz|right.{0,12}work|legally.{0,20}eligible|citizen", re.I), "Yes"),
+    (re.compile(r"sponsor", re.I), "No"),
+    (re.compile(r"ever\s+been\s+employed|previously.{0,12}employ|relative|related.*employee", re.I), "No"),
+    (re.compile(r"criminal|felony|arrest", re.I), "No"),
+    (re.compile(r"\brelocat\b", re.I), "Yes"),
+    (re.compile(r"veteran", re.I), "I am not a protected veteran"),
+    (re.compile(r"disabilit", re.I), "I choose not to self-identify"),
+    (re.compile(r"^gender$|gender.*identif", re.I), "Male"),
 ]
 
 
-def get_preset_answer(label: str, profile: dict) -> Optional[str]:
-    """
-    Return a pre-stored answer for a form field label, or None if not found.
-    Checks profile field patterns first, then common screening patterns.
-    """
-    label_lower = label.lower().strip()
-
-    # Profile field map
-    for pattern, key in _PROFILE_FIELD_PATTERNS:
-        if re.search(pattern, label_lower):
-            value = profile.get(key, "")
-            if value is not None and str(value).strip():
-                return str(value).strip()
-
-    # General screening patterns
-    for pattern, answer in _PRESET_PATTERNS:
-        if re.search(pattern, label_lower):
-            return answer
-
-    # Direct key match from applicant_answers.yaml custom entries
-    for key, value in profile.items():
-        if key.lower().replace("_", " ") == label_lower and value:
-            return str(value)
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Claude API answer generation
-# ---------------------------------------------------------------------------
-
-def _build_system_prompt(profile: dict, resume_text: str) -> str:
-    return (
-        f"You are filling a job application form on behalf of {profile.get('name', 'the applicant')}.\n\n"
-        f"Applicant Profile:\n"
-        f"  Name:           {profile.get('name', '')}\n"
-        f"  Email:          {profile.get('email', '')}\n"
-        f"  Phone:          {profile.get('phone', '')}\n"
-        f"  Location:       {profile.get('location', 'Pune, Maharashtra, India')}\n"
-        f"  Current Role:   {profile.get('current_role', 'Senior Product Manager / Business Analyst')}\n"
-        f"  Yrs Experience: {profile.get('years_of_experience', '12')}\n"
-        f"  Current CTC:    {profile.get('current_ctc', '20 LPA')}\n"
-        f"  Expected CTC:   {profile.get('expected_ctc', '30 LPA')}\n"
-        f"  Notice Period:  {profile.get('notice_period', '60 days')}\n"
-        f"  Work Auth:      Authorized to work in India, no sponsorship needed\n\n"
-        + (("Resume Summary:\n" + profile.get("resume_summary", resume_text[:800]) + "\n\n")
-           if (profile.get("resume_summary") or resume_text) else "")
-        + "Rules:\n"
-        "- Reply with ONLY the answer value. No explanation, no quotes unless part of the value.\n"
-        "- For yes/no questions, reply Yes or No.\n"
-        "- For numeric fields, reply with a number only.\n"
-        "- For dropdown/radio, reply with the EXACT option text from the list provided.\n"
-        "- Never fabricate credentials or certifications not in the profile."
-    )
-
-
-def ask_claude(
-    label: str,
-    field_type: str,
-    options: list[str],
-    profile: dict,
-    resume_text: str = "",
-) -> str:
-    """Ask Claude to answer a form field. Falls back gracefully if API key not set."""
-    if not ANTHROPIC_API_KEY:
-        if options:
-            return options[0]
-        if field_type == "number":
-            return "12"
-        return ""
-
-    try:
-        import anthropic
-
-        if options:
-            user_msg = (
-                f'Form field: "{label}"\n'
-                f"Options: {options}\n"
-                f"Choose the most appropriate option and reply with its EXACT text."
-            )
-        elif field_type == "number":
-            user_msg = f'Form field: "{label}"\nReply with a single integer.'
-        elif field_type in ("textarea", "text_long"):
-            user_msg = (
-                f'Form field: "{label}"\n'
-                f"Write 2-3 professional sentences for the applicant."
-            )
-        else:
-            user_msg = f'Form field: "{label}"\nReply with a brief appropriate value (one line).'
-
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(
-            model=_MODEL,
-            max_tokens=300,
-            system=_build_system_prompt(profile, resume_text),
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        return resp.content[0].text.strip()
-
-    except Exception as exc:
-        print(f"    [FormFillerAI] Claude API error for '{label}': {exc}")
-        return options[0] if options else ""
-
-
-# ---------------------------------------------------------------------------
-# Option matching (Levenshtein, no external dependency)
-# ---------------------------------------------------------------------------
-
-def _levenshtein(a: str, b: str) -> int:
-    if len(a) < len(b):
-        a, b = b, a
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a):
-        curr = [i + 1]
-        for j, cb in enumerate(b):
-            curr.append(min(prev[j] + (ca != cb), prev[j + 1] + 1, curr[-1] + 1))
-        prev = curr
-    return prev[-1]
-
-
-def find_best_option(answer: str, options: list[str]) -> Optional[str]:
-    """Find the closest matching option to the AI-generated answer."""
-    if not options:
-        return None
-    ans = answer.lower().strip()
-    skip = {"select an option", "please select", "choose one", "- select -", ""}
-    candidates = [o for o in options if o.lower().strip() not in skip]
-    if not candidates:
-        return options[0] if options else None
-
-    for opt in candidates:
-        if opt.lower().strip() == ans:
-            return opt
-    for opt in candidates:
-        if opt.lower().startswith(ans) or ans.startswith(opt.lower().strip()):
-            return opt
-    for opt in candidates:
-        if ans in opt.lower() or opt.lower() in ans:
-            return opt
-
-    return min(candidates, key=lambda o: _levenshtein(ans, o.lower().strip()))
-
-
-# ---------------------------------------------------------------------------
-# Honeypot / bot-trap detection
-# ---------------------------------------------------------------------------
-
-_HONEYPOT_LABEL_RE = re.compile(
-    r"robots?\s+only|do\s+not\s+enter|leave\s+(this\s+)?blank|"
-    r"if\s+you'?re\s+human|bot\s+field",
-    re.IGNORECASE,
-)
-_HONEYPOT_NAME_RE = re.compile(
-    r"beecatcher|honeypot|honey_pot|hpot|bot.?catch|spam.?trap|"
-    r"confirm.?email.?address.?hidden",
-    re.IGNORECASE,
-)
-
-
-def _is_honeypot(el, label: str) -> bool:
-    """
-    Detect anti-bot honeypot fields (e.g. Citi Workday's 'beecatcher' /
-    'This input is for robots only'). Filling these flags us as a bot, so skip.
-    """
-    if label and _HONEYPOT_LABEL_RE.search(label):
-        return True
-    try:
-        for attr in ("name", "id", "data-automation-id", "aria-label"):
-            v = el.get_attribute(attr) or ""
-            if v and _HONEYPOT_NAME_RE.search(v):
+def _select_radio(page, radios, target_value: str) -> bool:
+    """Click the radio button whose label/value best matches target_value."""
+    target = target_value.lower()
+    for radio in radios:
+        try:
+            val = (radio.get_attribute("value") or "").lower()
+            el_id = radio.get_attribute("id") or ""
+            label_text = ""
+            if el_id:
+                lbl = page.query_selector(f'label[for="{el_id}"]')
+                if lbl:
+                    label_text = lbl.inner_text().lower()
+            if val == target or label_text.startswith(target) or target in label_text:
+                radio.click()
+                page.wait_for_timeout(400)
                 return True
-        # Visually hidden inputs that still report visible are classic honeypots
-        style = (el.get_attribute("style") or "").replace(" ", "").lower()
-        if "opacity:0" in style or "display:none" in style or "visibility:hidden" in style:
-            return True
-    except Exception:
-        pass
+        except Exception:
+            pass
+    # Fuzzy: first radio whose value contains first word of target
+    first_word = target.split()[0] if target.split() else target
+    for radio in radios:
+        try:
+            val = (radio.get_attribute("value") or "").lower()
+            if first_word in val:
+                radio.click()
+                page.wait_for_timeout(400)
+                return True
+        except Exception:
+            pass
     return False
 
 
-# ---------------------------------------------------------------------------
-# Main page filler
-# ---------------------------------------------------------------------------
-
-def fill_page_fields(
-    page,
-    profile: dict,
-    resume_text: str = "",
-    skip_filled: bool = True,
-    verbose: bool = True,
-) -> int:
-    """
-    Scan visible form fields on `page` and fill each unfilled one.
-    Returns number of fields acted on.
-    """
-    filled = 0
-
-    # ── Text / email / tel / number inputs ──────────────────────────────────
-    input_selectors = [
-        ("text",   'input[type="text"]:not([readonly]):not([disabled])'),
-        ("text",   'input:not([type]):not([readonly]):not([disabled])'),
-        ("number", 'input[type="number"]:not([readonly]):not([disabled])'),
-        ("email",  'input[type="email"]:not([readonly]):not([disabled])'),
-        ("tel",    'input[type="tel"]:not([readonly]):not([disabled])'),
-        ("textarea", 'textarea:not([readonly]):not([disabled])'),
-    ]
-
-    for ftype, selector in input_selectors:
-        try:
-            elements = page.query_selector_all(selector)
-        except Exception:
-            continue
-
-        for el in elements:
-            try:
-                if not el.is_visible():
-                    continue
-                if skip_filled:
-                    current = el.input_value()
-                    if current and current.strip():
-                        continue
-                label = _get_element_label(page, el)
-                if not label:
-                    continue
-                if _is_honeypot(el, label):
-                    if verbose:
-                        print(f"    [FormFillerAI] Skipping honeypot field '{label[:40]}'")
-                    continue
-                answer = get_preset_answer(label, profile)
-                if answer is None:
-                    answer = ask_claude(label, ftype, [], profile, resume_text)
-                if answer:
-                    el.fill(str(answer))
-                    filled += 1
-                    if verbose:
-                        print(f"    [FormFillerAI] '{label[:45]}' ← '{str(answer)[:35]}'")
-            except Exception as exc:
-                if verbose:
-                    print(f"    [FormFillerAI] Skip input ({exc.__class__.__name__})")
-
-    # ── Select dropdowns ────────────────────────────────────────────────────
+def _radio_group_question(page, name: str, legend_text: str,
+                          profile: dict, resume_text: str) -> Optional[str]:
+    """Determine the answer for a radio group using presets or council."""
+    combined = f"{legend_text} {name}".strip()
+    for pattern, answer in _RADIO_PRESET:
+        if pattern.search(combined):
+            return answer
+    # Council fallback for unknown radio groups
     try:
-        selects = page.query_selector_all("select:not([disabled])")
+        from utils.llm_council import ask_council_brief
+        system = (
+            "You are filling a job application. For radio button questions, "
+            "reply with ONLY the answer text — no explanation, no quotes."
+        )
+        q = (
+            f'Radio button question: "{combined}"\n'
+            f"Applicant: {profile.get('name', '')} in {profile.get('location', '')}\n"
+            f"What should be selected? Reply with the answer text only."
+        )
+        return ask_council_brief(q, system=system, max_tokens=32)
+    except ImportError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def fill_page_fields(page, profile: "dict | None" = None,
+                     resume_text: str = "") -> int:
+    """
+    Fill all visible text/email/tel/number inputs on the page.
+    Returns the count of fields filled.
+    """
+    if profile is None:
+        profile = load_applicant_profile()
+
+    filled = 0
+    try:
+        inputs = page.query_selector_all(
+            "input[type='text'], input[type='email'], input[type='tel'], "
+            "input[type='number'], input[type='url'], textarea, "
+            "input:not([type])"
+        )
+        for inp in inputs:
+            try:
+                if not inp.is_visible():
+                    continue
+                if inp.get_attribute("disabled") or inp.get_attribute("readonly"):
+                    continue
+                # Skip already-filled fields
+                try:
+                    current = inp.input_value() or ""
+                    if current.strip():
+                        continue
+                except Exception:
+                    pass
+
+                label = _get_label(page, inp)
+
+                if _is_honeypot(inp, label):
+                    print(f"    [FormFillerAI] Skipping honeypot field '{label[:50]}'")
+                    continue
+
+                value = _preset_answer(label, profile, resume_text)
+                if not value and label:
+                    field_type = inp.get_attribute("type") or "text"
+                    value = _council_answer(label, field_type, profile, resume_text)
+
+                if value:
+                    _react_fill(page, inp, value)
+                    print(f"    [FormFillerAI] '{label[:40]}' <- '{value[:40]}'")
+                    filled += 1
+            except Exception:
+                pass
     except Exception:
-        selects = []
-
-    for sel_el in selects:
-        try:
-            if not sel_el.is_visible():
-                continue
-            label = _get_element_label(page, sel_el)
-            options: list[str] = page.evaluate(
-                "el => Array.from(el.options).map(o => o.text.trim())", sel_el
-            )
-            if not options:
-                continue
-            answer = get_preset_answer(label or "dropdown", profile)
-            if answer is None:
-                answer = ask_claude(label or "dropdown", "select", options, profile, resume_text)
-            match = find_best_option(answer, options)
-            if match:
-                sel_el.select_option(label=match)
-                filled += 1
-                if verbose:
-                    print(f"    [FormFillerAI] '{label[:45]}' ← '{match[:35]}' (select)")
-        except Exception as exc:
-            if verbose:
-                print(f"    [FormFillerAI] Skip select ({exc.__class__.__name__})")
-
+        pass
     return filled
 
 
-# ---------------------------------------------------------------------------
-# Radio button filler (LinkedIn Easy Apply style: fieldset + legend)
-# ---------------------------------------------------------------------------
-
-def _radio_option_text(page, r) -> str:
-    """Best-effort visible label for a single radio input."""
-    lbl_id = r.get_attribute("id")
-    if lbl_id:
-        lbl = page.query_selector(f'label[for="{lbl_id}"]')
-        if lbl:
-            t = lbl.inner_text().strip()
-            if t:
-                return t
-    aria = r.get_attribute("aria-label")
-    if aria:
-        return aria.strip()
-    # label ancestor
-    try:
-        t = r.evaluate("el => { const l = el.closest('label'); return l ? l.innerText : ''; }")
-        if t and t.strip():
-            return t.strip()
-    except Exception:
-        pass
-    return r.get_attribute("value") or ""
-
-
-def _radio_group_question(page, first_radio, name: str) -> str:
-    """Find the question text for a name-grouped radio set (no fieldset/legend)."""
-    # aria-labelledby on the group container or the radio itself
-    lbl = _get_element_label(page, first_radio)
-    if lbl and lbl.lower() not in ("yes", "no"):
-        return lbl
-    # Walk up to a container and grab its leading text / a label / legend / [role=group] aria
-    try:
-        txt = first_radio.evaluate(
-            """el => {
-                let node = el;
-                for (let i = 0; i < 5 && node; i++) {
-                    node = node.parentElement;
-                    if (!node) break;
-                    const grp = node.matches('[role=\\'group\\'],[role=\\'radiogroup\\'],fieldset,'
-                              + '[data-automation-id]') ? node : null;
-                    if (grp) {
-                        const al = grp.getAttribute('aria-label');
-                        if (al) return al;
-                        const leg = grp.querySelector('legend,label,h2,h3,.gwt-Label,[id$=\\'label\\']');
-                        if (leg && leg.innerText.trim()) return leg.innerText;
-                    }
-                }
-                return '';
-            }"""
-        )
-        if txt and txt.strip():
-            return txt.strip().rstrip("*").strip()
-    except Exception:
-        pass
-    return name  # last resort: the field name itself (e.g. 'work_auth')
-
-
-def fill_radio_groups(page, profile: dict, resume_text: str = "") -> int:
+def fill_radio_groups(page, profile: "dict | None" = None,
+                      resume_text: str = "") -> int:
     """
-    Fill radio button groups on a form page.
-
-    Handles two layouts:
-      1. <fieldset><legend>Question</legend> ... </fieldset>  (LinkedIn Easy Apply)
-      2. radios sharing a `name` attribute with the question in a nearby label /
-         aria-label / container (Workday and most standard HTML forms)
+    Fill radio button groups on the current ATS page.
+    Handles Workday's <fieldset>/<legend> pattern and name-grouped radios.
+    Returns the count of groups filled.
     """
+    if profile is None:
+        profile = load_applicant_profile()
+
     filled = 0
-    handled_names: set = set()
 
-    # ── Layout 1: fieldset + legend ─────────────────────────────────────────
+    # Strategy 1: <fieldset><legend> pattern
     try:
-        for fs in page.query_selector_all("fieldset"):
+        fieldsets = page.query_selector_all("fieldset")
+        for fs in fieldsets:
             try:
                 legend = fs.query_selector("legend")
-                if not legend:
-                    continue
-                question = legend.inner_text().strip().rstrip("*").strip()
-                radios = fs.query_selector_all('input[type="radio"]')
+                legend_text = legend.inner_text().strip() if legend else ""
+                radios = fs.query_selector_all("input[type='radio']")
                 if not radios:
                     continue
-                options = [(_radio_option_text(page, r), r) for r in radios]
-                for r in radios:
-                    nm = r.get_attribute("name")
-                    if nm:
-                        handled_names.add(nm)
-                if _select_radio(page, question, options, profile, resume_text):
+                answer = _radio_group_question(page, "", legend_text, profile, resume_text)
+                if answer and _select_radio(page, radios, answer):
+                    print(f"    [FormFillerAI] Radio '{legend_text[:40]}' <- '{answer[:30]}'")
                     filled += 1
             except Exception:
                 pass
     except Exception:
         pass
 
-    # ── Layout 2: radios grouped by `name` attribute ────────────────────────
+    # Strategy 2: name-grouped radios (Workday's pattern)
     try:
-        groups: dict = {}
-        for r in page.query_selector_all('input[type="radio"]'):
+        all_radios = page.query_selector_all("input[type='radio']")
+        by_name: "dict[str, list]" = {}
+        for r in all_radios:
             try:
-                if not r.is_visible():
-                    continue
-                nm = r.get_attribute("name") or ""
-                if not nm or nm in handled_names:
-                    continue
-                groups.setdefault(nm, []).append(r)
+                name = r.get_attribute("name") or ""
+                if name:
+                    by_name.setdefault(name, []).append(r)
             except Exception:
                 pass
 
-        for nm, radios in groups.items():
+        for name, radios in by_name.items():
             try:
-                options = [(_radio_option_text(page, r), r) for r in radios]
-                question = _radio_group_question(page, radios[0], nm)
-                if _select_radio(page, question, options, profile, resume_text):
+                # Check if we're inside a fieldset already handled
+                in_fieldset = radios[0].evaluate("el => !!el.closest('fieldset')")
+                if in_fieldset:
+                    continue
+
+                # Try aria-label on the group container
+                group_label = name
+                container = radios[0].evaluate_handle(
+                    "el => el.closest('[role=\"group\"], [role=\"radiogroup\"]') || el.parentElement"
+                ).as_element()
+                if container:
+                    aria = container.get_attribute("aria-label") or ""
+                    if aria:
+                        group_label = aria
+
+                answer = _radio_group_question(page, name, group_label, profile, resume_text)
+                if answer and _select_radio(page, radios, answer):
+                    print(f"    [FormFillerAI] Radio '{group_label[:40]}' <- '{answer[:30]}'")
                     filled += 1
             except Exception:
                 pass
@@ -597,25 +508,3 @@ def fill_radio_groups(page, profile: dict, resume_text: str = "") -> int:
         pass
 
     return filled
-
-
-def _select_radio(page, question, options, profile, resume_text) -> bool:
-    """Choose and click the best radio option for a question. Returns True if clicked."""
-    option_texts = [o[0] for o in options if o[0]]
-    if not option_texts:
-        return False
-    answer = get_preset_answer(question, profile)
-    if answer is None:
-        answer = ask_claude(question, "radio", option_texts, profile, resume_text)
-    best = find_best_option(answer, option_texts)
-    if not best:
-        return False
-    for opt_text, radio_el in options:
-        if opt_text == best:
-            try:
-                radio_el.click()
-                print(f"    [FormFillerAI] Radio '{question[:40]}' ← '{best[:30]}'")
-                return True
-            except Exception:
-                return False
-    return False

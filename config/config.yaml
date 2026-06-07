@@ -46,6 +46,27 @@ applicant:
   linkedin_url: "https://www.linkedin.com/in/itsabhisheksaha/"
   location: "Pune, Maharashtra, India"
 
+# ── LLM Council (karpathy/llm-council pattern) ─────────────────────────────
+# Multi-model deliberation for resume tailoring, form filling, and job scoring.
+# Set OPENROUTER_API_KEY environment variable to enable full council.
+# Falls back to single Anthropic call (ANTHROPIC_API_KEY) when OpenRouter not set.
+council:
+  # Council members queried in parallel (Stage 1 + Stage 2)
+  members:
+    - "anthropic/claude-sonnet-4-6"
+    - "openai/gpt-4o"
+    - "google/gemini-2.0-flash"
+    - "meta-llama/llama-3.3-70b-instruct"
+  # Chairman synthesizes final answer (Stage 3)
+  chairman: "anthropic/claude-opus-4-8"
+  # Where to apply the council (each adds API cost; disable to skip)
+  use_for:
+    resume_tailoring: true   # Council writes the professional summary
+    form_filling: true       # Council answers unknown ATS screening questions
+    job_scoring: true        # Council scores job fit before applying
+  # Jobs scoring below this threshold are skipped (0-10 scale)
+  min_job_score: 6.0
+
 application:
   log_file: "logs/applications.json"
   # Seconds to wait between applications to avoid rate limiting

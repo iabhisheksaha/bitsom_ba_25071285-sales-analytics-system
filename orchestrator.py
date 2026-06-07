@@ -155,6 +155,22 @@ def run_pipeline(config: dict) -> None:
 
     _checkpoint("discovered_jobs.json", [vars(j) for j in jobs])
 
+    # --- Council: Job Scoring (filter before tailoring) ---
+    council_cfg = config.get("council", {})
+    if council_cfg.get("use_for", {}).get("job_scoring", False):
+        min_score = council_cfg.get("min_job_score", 6.0)
+        print(f"\n[Council] Scoring {len(jobs)} jobs (min score: {min_score}/10)…")
+        try:
+            from utils.job_scorer import filter_jobs_by_score
+            from utils.ai_form_filler import load_applicant_profile
+            profile = load_applicant_profile()
+            jobs = filter_jobs_by_score(jobs, profile, min_score=min_score)
+            if not jobs:
+                print("[Orchestrator] No jobs passed scoring threshold. Exiting.")
+                return
+        except Exception as exc:
+            print(f"[Council] Job scoring failed ({exc}) — continuing with all jobs.")
+
     # --- Agent 2: Resume Tailoring ---
     print(f"\n[Step 2/3] Tailoring resume for {len(jobs)} jobs…")
     tailoring_agent = ResumeTailoringAgent(config)
@@ -268,6 +284,16 @@ if __name__ == "__main__":
         print("\n[Step 1/2] Discovering jobs…")
         jobs = JobDiscoveryAgent(cfg).discover()
         _checkpoint("discovered_jobs.json", [vars(j) for j in jobs])
+        council_cfg = cfg.get("council", {})
+        if jobs and council_cfg.get("use_for", {}).get("job_scoring", False):
+            min_score = council_cfg.get("min_job_score", 6.0)
+            print(f"\n[Council] Scoring {len(jobs)} jobs (min score: {min_score}/10)…")
+            try:
+                from utils.job_scorer import filter_jobs_by_score
+                from utils.ai_form_filler import load_applicant_profile
+                jobs = filter_jobs_by_score(jobs, load_applicant_profile(), min_score=min_score)
+            except Exception as exc:
+                print(f"[Council] Scoring skipped: {exc}")
         print(f"\n[Step 2/2] Tailoring resumes for {len(jobs)} jobs…")
         agent = ResumeTailoringAgent(cfg)
         for job in jobs:
