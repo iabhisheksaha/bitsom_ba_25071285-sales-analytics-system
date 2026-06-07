@@ -4,9 +4,11 @@
 #   - Python 3.11 installed and on PATH
 #   - pip, git on PATH
 #   - Windows Credential Manager entries (create once with New-StoredCredential):
-#       JobApp_CRED_KEY       — Fernet key (from first-time orchestrator --init-creds)
-#       JobApp_TG_BOT_TOKEN   — Telegram bot token
-#       JobApp_TG_CHAT_ID     — Telegram chat ID
+#       JobApp_CRED_KEY         — Fernet key (from orchestrator --init-creds)
+#       JobApp_TG_BOT_TOKEN     — Telegram bot token
+#       JobApp_TG_CHAT_ID       — Telegram chat ID
+#       JobApp_ANTHROPIC_KEY    — Anthropic API key (enables LLM Council scoring)
+#       JobApp_OPENROUTER_KEY   — OpenRouter API key (optional; enables multi-model council)
 #
 # Usage:
 #   Right-click → "Run with PowerShell"  OR
@@ -34,6 +36,24 @@ Write-Host "[1/7] Loading secrets from Windows Credential Manager..."
 $env:CRED_KEY           = Get-Cred "JobApp_CRED_KEY"
 $env:TELEGRAM_BOT_TOKEN = Get-Cred "JobApp_TG_BOT_TOKEN"
 $env:TELEGRAM_CHAT_ID   = Get-Cred "JobApp_TG_CHAT_ID"
+
+# LLM Council API keys — optional but strongly recommended for real AI scoring.
+# If missing, council falls back to heuristic scores (flat 7.0 for all jobs).
+$anthropicCred = Get-StoredCredential -Target "JobApp_ANTHROPIC_KEY"
+if ($anthropicCred) {
+    $env:ANTHROPIC_API_KEY = $anthropicCred.GetNetworkCredential().Password
+    Write-Host "      ANTHROPIC_API_KEY loaded (LLM Council enabled)."
+} else {
+    Write-Host "      WARNING: JobApp_ANTHROPIC_KEY not found — council scoring will use heuristics."
+    Write-Host "               Add it with: New-StoredCredential -Target 'JobApp_ANTHROPIC_KEY' -UserName key -Password '<your-key>' -Persist LocalMachine"
+}
+
+$openrouterCred = Get-StoredCredential -Target "JobApp_OPENROUTER_KEY"
+if ($openrouterCred) {
+    $env:OPENROUTER_API_KEY = $openrouterCred.GetNetworkCredential().Password
+    Write-Host "      OPENROUTER_API_KEY loaded (full multi-model council enabled)."
+}
+
 Write-Host "      Secrets loaded OK."
 
 # ── 2. Locate / clone the repo ────────────────────────────────────────────────
