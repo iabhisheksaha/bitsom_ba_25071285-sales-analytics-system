@@ -213,7 +213,8 @@ class TelegramNotifier:
         )
         self.send(msg)
 
-    def send_daily_summary(self, submitted: list[dict], failed: list[dict]) -> None:
+    def send_daily_summary(self, submitted: list[dict], failed: list[dict],
+                           skipped: list[dict] | None = None) -> None:
         today = date.today().isoformat()
         lines = [f"*Daily Application Summary — {today}*\n"]
         lines.append(f"✅ Submitted: *{len(submitted)}*")
@@ -223,6 +224,13 @@ class TelegramNotifier:
             lines.append(f"\n❌ Failed: *{len(failed)}*")
             for app in failed:
                 lines.append(f"  • {app['company']}: {app.get('reason', 'unknown')}")
+        if skipped:
+            lines.append(f"\n⏭ Skipped: *{len(skipped)}*")
+            # Aggregate skip reasons to keep message compact
+            from collections import Counter
+            reasons = Counter(app.get('reason', 'unknown') for app in skipped)
+            for reason, count in reasons.most_common(5):
+                lines.append(f"  • {count}× {reason[:60]}")
         self.send("\n".join(lines))
 
     def _poll_updates(self, timeout_seconds: int, trigger_fn, poll_interval: int = 10):
@@ -352,7 +360,8 @@ class EmailNotifier:
             print(f"  [Agent3/Email] Send failed: {exc}")
             return False
 
-    def send_daily_summary(self, submitted: list[dict], failed: list[dict]) -> None:
+    def send_daily_summary(self, submitted: list[dict], failed: list[dict],
+                           skipped: list[dict] | None = None) -> None:
         today = date.today().strftime("%d %b %Y")
         lines = [f"Job Application Summary — {today}\n"]
         lines.append(f"Submitted: {len(submitted)}")
@@ -362,6 +371,11 @@ class EmailNotifier:
             lines.append(f"\nFailed: {len(failed)}")
             for a in failed:
                 lines.append(f"  ✗ {a['company']}: {a.get('reason','')}")
+        if skipped:
+            lines.append(f"\nSkipped: {len(skipped)}")
+            from collections import Counter
+            for reason, count in Counter(a.get('reason','') for a in skipped).most_common(5):
+                lines.append(f"  ⏭ {count}× {reason[:60]}")
         self._send(
             subject=f"[JobApp] {len(submitted)} applications submitted — {today}",
             body="\n".join(lines),
@@ -1867,13 +1881,18 @@ class ApplicationLog:
         }
         self._save()
 
-    def todays_summary(self) -> tuple[list[dict], list[dict]]:
+    def todays_summary(self) -> tuple[list[dict], list[dict], list[dict]]:
         today = date.today().isoformat()
-        submitted, failed = [], []
+        submitted, failed, skipped = [], [], []
         for entry in self._data.values():
             if entry["timestamp"].startswith(today):
-                (submitted if entry["status"] == "submitted" else failed).append(entry)
-        return submitted, failed
+                if entry["status"] == "submitted":
+                    submitted.append(entry)
+                elif entry["status"] == "skipped":
+                    skipped.append(entry)
+                else:
+                    failed.append(entry)
+        return submitted, failed, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -1897,6 +1916,7 @@ class ApplicationAgent:
         # rather than re-authenticating on every job (slow + anti-bot risk).
         self._li_handler: "Optional[LinkedInHandler]" = None
         self._li_login_tried: bool = False
+        self._li_login_fail_reason: str = "linkedin: no credentials stored for Easy Apply"
 
         tg_cfg = config.get("telegram", {})
         bot_token = os.environ.get(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"), "")
@@ -1990,12 +2010,13 @@ class ApplicationAgent:
             for platform, platform_jobs in by_platform.items():
                 self._process_platform(playwright, platform, platform_jobs, tailored_resumes)
 
-        submitted, failed = self.log.todays_summary()
-        print(f"\n[Agent3] Daily totals — submitted: {len(submitted)}, failed: {len(failed)}")
+        submitted, failed, skipped = self.log.todays_summary()
+        print(f"\n[Agent3] Daily totals — submitted: {len(submitted)}, "
+              f"failed: {len(failed)}, skipped: {len(skipped)}")
         if self.telegram:
-            self.telegram.send_daily_summary(submitted, failed)
+            self.telegram.send_daily_summary(submitted, failed, skipped)
         if self.email.enabled:
-            self.email.send_daily_summary(submitted, failed)
+            self.email.send_daily_summary(submitted, failed, skipped)
             print("[Agent3] Daily summary emailed.")
         # Always write a file report
         from daily_report import format_report, save_report
@@ -2124,7 +2145,9 @@ class ApplicationAgent:
         handler = LinkedInHandler(page)
         ok = handler.login(creds["username"], creds["password"])
         if not ok:
-            print("  [Agent3] LinkedIn login failed — Easy Apply disabled for this run.")
+            print("  [Agent3] LinkedIn login blocked (checkpoint/authwall from CI IP) — "
+                  "Easy Apply skipped for this run. Run locally for Easy Apply jobs.")
+            self._li_login_fail_reason = "linkedin: login blocked in CI (use local run for Easy Apply)"
             return None
         self._li_handler = handler
         return handler
@@ -2177,8 +2200,10 @@ class ApplicationAgent:
                 print(f"  [Agent3/LinkedIn] Easy Apply job — using LinkedInHandler for {job.company}.")
                 handler = self._get_linkedin_handler(page)
                 if handler is None:
-                    self.log.record(job, "skipped", "linkedin: no credentials stored for Easy Apply")
-                    print(f"  [Agent3/LinkedIn] No LinkedIn credentials — skipping {job.company}.")
+                    reason = getattr(self, "_li_login_fail_reason",
+                                     "linkedin: no credentials stored for Easy Apply")
+                    self.log.record(job, "skipped", reason)
+                    print(f"  [Agent3/LinkedIn] Skipping {job.company} ({reason}).")
                     return
                 try:
                     success = handler.apply(job, resume_path)
