@@ -25,32 +25,70 @@ from typing import Optional
 _PROFILE_CACHE: "dict | None" = None
 
 
-def load_applicant_profile(config_path: str = "config/config.yaml") -> dict:
+def load_applicant_profile(config_path: str = "config/config.yaml",
+                           answers_path: str = "config/applicant_answers.yaml") -> dict:
+    """Build the applicant profile from config + the stored-answers file.
+
+    The ``applicant:`` block of config.yaml supplies identity/contact details;
+    ``applicant_answers.yaml`` supplies the extended screening answers
+    (experience, compensation, EEO, etc.). The answers file is the base layer;
+    non-empty identity values from config.yaml are overlaid on top so config
+    stays authoritative for contact details without blank fields clobbering
+    stored answers.
+    """
     global _PROFILE_CACHE
     if _PROFILE_CACHE is not None:
         return _PROFILE_CACHE
+
+    import yaml
+
+    # --- base layer: stored answers file (optional) ---
+    answers: dict = {}
     try:
-        import yaml
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
-        raw = cfg.get("applicant", {})
-        name = raw.get("name", "")
-        parts = name.split(" ", 1)
-        _PROFILE_CACHE = {
-            "name":         name,
-            "first_name":   parts[0] if parts else "",
-            "last_name":    parts[1] if len(parts) > 1 else "",
-            "email":        raw.get("email", ""),
-            "phone":        raw.get("phone", ""),
-            "linkedin_url": raw.get("linkedin_url", ""),
-            "location":     raw.get("location", ""),
-            "city":         raw.get("location", "").split(",")[0].strip(),
-            "current_ctc":   raw.get("current_ctc", ""),
-            "expected_ctc":  raw.get("expected_ctc", ""),
-            "notice_period": raw.get("notice_period", "30 days"),
-        }
+        with open(answers_path) as f:
+            answers = yaml.safe_load(f) or {}
     except Exception:
-        _PROFILE_CACHE = {}
+        answers = {}
+
+    # --- identity layer: config applicant block ---
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        raw = cfg.get("applicant", {}) or {}
+    except Exception:
+        raw = {}
+
+    name = raw.get("name", "") or answers.get("name", "")
+    parts = name.split(" ", 1)
+    location = raw.get("location", "") or answers.get("location", "")
+
+    profile: dict = dict(answers)  # start from stored answers
+    identity = {
+        "name":         name,
+        "first_name":   parts[0] if parts else "",
+        "last_name":    parts[1] if len(parts) > 1 else "",
+        "email":        raw.get("email", ""),
+        "phone":        raw.get("phone", ""),
+        "linkedin_url": raw.get("linkedin_url", ""),
+        "location":     location,
+        "city":         (location.split(",")[0].strip() if location
+                         else answers.get("city", "")),
+    }
+    # Overlay only non-empty identity values so config blanks don't wipe answers.
+    for k, v in identity.items():
+        if v or k not in profile:
+            profile[k] = v
+
+    # Comp / notice: config wins when set, else fall back to answers file.
+    for key, default in (("current_ctc", ""), ("expected_ctc", ""),
+                         ("notice_period", "30 days")):
+        cfg_val = raw.get(key, "")
+        if cfg_val:
+            profile[key] = cfg_val
+        else:
+            profile.setdefault(key, answers.get(key, default))
+
+    _PROFILE_CACHE = profile
     return _PROFILE_CACHE
 
 
@@ -157,12 +195,17 @@ _PRESET_PATTERNS: "list[tuple[re.Pattern, object]]" = [
     (re.compile(r"travel.{0,12}(willing|required|percent)", re.I), "Yes, up to 25%"),
 
     # DEI / voluntary self-identification.
-    # These are optional EEO fields; default to "decline to self-identify"
-    # rather than asserting demographics on the applicant's behalf.
-    (re.compile(r"\bveteran\b|military.{0,8}service", re.I), "I choose not to self-identify"),
-    (re.compile(r"\bdisabilit\b", re.I), "I choose not to self-identify"),
-    (re.compile(r"^gender$|gender.{0,6}(identif|pronoun)", re.I), "Decline to self-identify"),
-    (re.compile(r"ethnicity|race|national.{0,6}origin", re.I), "Decline to self-identify"),
+    # Optional EEO fields: use the applicant's explicitly-stored answer when
+    # present, otherwise default to "decline to self-identify" rather than
+    # asserting demographics on their behalf.
+    (re.compile(r"\bveteran\b|military.{0,8}service", re.I),
+     lambda p, _: p.get("veteran_status") or "I choose not to self-identify"),
+    (re.compile(r"\bdisabilit\b", re.I),
+     lambda p, _: p.get("disability_status") or "I choose not to self-identify"),
+    (re.compile(r"^gender$|gender.{0,6}(identif|pronoun)", re.I),
+     lambda p, _: p.get("gender") or "Decline to self-identify"),
+    (re.compile(r"ethnicity|race|national.{0,6}origin", re.I),
+     lambda p, _: p.get("ethnicity") or "Decline to self-identify"),
 ]
 
 
@@ -294,7 +337,12 @@ def _council_answer(label: str, field_type: str,
         f"Resume excerpt (first 600 chars):\n{resume_text[:600]}\n\n"
         f"What should be entered in this field?"
     )
-    return _sanitize_value(ask_council_brief(question, system=system, max_tokens=64))
+    try:
+        return _sanitize_value(ask_council_brief(question, system=system, max_tokens=64))
+    except Exception:
+        # No API key, network error, etc. — leave the field for a human rather
+        # than aborting; presets already handled the known fields.
+        return ""
 
 
 def _sanitize_value(raw: str) -> str:
@@ -338,15 +386,21 @@ def _single_model_answer(label: str, field_type: str,
 # Radio group handling
 # ---------------------------------------------------------------------------
 
-_RADIO_PRESET: "list[tuple[re.Pattern, str]]" = [
-    (re.compile(r"work.{0,20}authoriz|right.{0,12}work|legally.{0,20}eligible|citizen", re.I), "Yes"),
+# (regex, answer_or_callable) — callables receive (profile,) and return a str.
+_RADIO_PRESET: "list[tuple[re.Pattern, object]]" = [
+    # Work auth: explicit phrasing only — do NOT blanket-match "citizen".
+    (re.compile(r"work.{0,20}authoriz|right.{0,12}work|legally.{0,20}eligible|"
+                r"authoriz.{0,12}(to\s+)?work", re.I), "Yes"),
     (re.compile(r"sponsor", re.I), "No"),
     (re.compile(r"ever\s+been\s+employed|previously.{0,12}employ|relative|related.*employee", re.I), "No"),
     (re.compile(r"criminal|felony|arrest", re.I), "No"),
     (re.compile(r"\brelocat\b", re.I), "Yes"),
-    (re.compile(r"veteran", re.I), "I am not a protected veteran"),
-    (re.compile(r"disabilit", re.I), "I choose not to self-identify"),
-    (re.compile(r"^gender$|gender.*identif", re.I), "Male"),
+    (re.compile(r"veteran", re.I),
+     lambda p: p.get("veteran_status") or "I choose not to self-identify"),
+    (re.compile(r"disabilit", re.I),
+     lambda p: p.get("disability_status") or "I choose not to self-identify"),
+    (re.compile(r"^gender$|gender.*identif", re.I),
+     lambda p: p.get("gender") or "Decline to self-identify"),
 ]
 
 
@@ -391,7 +445,7 @@ def _radio_group_question(page, name: str, legend_text: str,
     combined = f"{legend_text} {name}".strip()
     for pattern, answer in _RADIO_PRESET:
         if pattern.search(combined):
-            return answer
+            return answer(profile) if callable(answer) else answer
     # Council fallback for unknown radio groups
     try:
         from utils.llm_council import ask_council_brief
@@ -404,14 +458,51 @@ def _radio_group_question(page, name: str, legend_text: str,
             f"Applicant: {profile.get('name', '')} in {profile.get('location', '')}\n"
             f"What should be selected? Reply with the answer text only."
         )
-        return ask_council_brief(q, system=system, max_tokens=32)
-    except ImportError:
+        return _sanitize_value(ask_council_brief(q, system=system, max_tokens=32)) or None
+    except Exception:
         return None
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def get_preset_answer(label: str, profile: "dict | None" = None,
+                      resume_text: str = "") -> Optional[str]:
+    """Deterministic preset answer for a field label (no API call).
+
+    Public, browser-free wrapper around the preset patterns — useful for
+    unit-testing the answer logic and for callers that just want the fast
+    lookup without the council fallback.
+    """
+    if profile is None:
+        profile = load_applicant_profile()
+    return _preset_answer(label, profile, resume_text)
+
+
+def find_best_option(answer: str, options: "list[str]") -> Optional[str]:
+    """Map a target answer (e.g. "Yes") onto the best-matching option string.
+
+    Used to align a preset/council answer with a fixed set of choices such as
+    radio labels or dropdown options. Matching precedence:
+    exact (case-insensitive) -> word-boundary -> substring either direction.
+    """
+    if not answer or not options:
+        return None
+    target = answer.strip().lower()
+    for opt in options:  # exact
+        if opt.strip().lower() == target:
+            return opt
+    word_re = re.compile(r"\b" + re.escape(target) + r"\b")
+    for opt in options:  # whole-word match (e.g. "Yes" in "Yes, I am authorized")
+        if word_re.search(opt.lower()):
+            return opt
+    for opt in options:  # option contained in a verbose answer (one direction only)
+        o = opt.strip().lower()
+        if o and o in target:
+            return opt
+    return None
+
 
 # Max LLM-council fallbacks per form-fill pass. The council is slow (up to ~9
 # sequential HTTP calls each, blocking the Playwright thread); without a cap a

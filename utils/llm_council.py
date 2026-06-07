@@ -462,6 +462,26 @@ async def _run_council(
 # ---------------------------------------------------------------------------
 
 
+def _run_sync(coro) -> str:
+    """Run an async coroutine to completion from synchronous code.
+
+    Uses ``asyncio.run`` normally, but when called from a thread that already
+    has a running event loop — e.g. inside Playwright's sync API, where
+    ``asyncio.run`` would raise and leave the coroutine un-awaited — the
+    coroutine is executed in a dedicated worker thread with its own loop.
+    """
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+
+    if running is not None and running.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(asyncio.run, coro).result()
+    return asyncio.run(coro)
+
+
 def ask_council(
     question: str,
     system: str = "",
@@ -483,7 +503,7 @@ def ask_council(
     :param max_tokens: Maximum tokens per model response (and for the synthesis).
     :returns: Chairman's final synthesized answer as a string.
     """
-    return asyncio.run(
+    return _run_sync(
         _run_council(
             question=question,
             system=system,
