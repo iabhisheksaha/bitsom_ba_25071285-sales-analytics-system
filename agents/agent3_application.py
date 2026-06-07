@@ -540,9 +540,24 @@ class LinkedInHandler(BaseApplicationHandler):
             self.page.fill("#password", password)
             self.page.click("button[type='submit']")
             self.page.wait_for_timeout(4000)
-            logged_in = "linkedin.com/feed" in self.page.url or "linkedin.com/in/" in self.page.url
-            print(f"    [LinkedIn] Login {'succeeded' if logged_in else 'may need verification'} — URL: {self.page.url[:60]}")
-            return logged_in
+            url = self.page.url
+            # Successful login lands on feed, profile, or mynetwork
+            if any(p in url for p in ("linkedin.com/feed", "linkedin.com/in/",
+                                       "linkedin.com/mynetwork", "linkedin.com/jobs")):
+                print(f"    [LinkedIn] Login succeeded — URL: {url[:60]}")
+                return True
+            # Security checkpoint, bot challenge, or verification — login blocked
+            if any(p in url for p in ("checkpoint", "challenge", "verify",
+                                       "authwall", "security", "uas/login")):
+                print(f"    [LinkedIn] Login blocked (checkpoint/authwall) — URL: {url[:60]}")
+                return False
+            # Still on login page → wrong credentials or captcha
+            if "linkedin.com/login" in url:
+                print(f"    [LinkedIn] Login failed (still on login page) — URL: {url[:60]}")
+                return False
+            # Unknown destination — be conservative in CI
+            print(f"    [LinkedIn] Login outcome unclear — URL: {url[:60]}")
+            return False
         except PWTimeout as exc:
             print(f"    [LinkedIn] Login timeout: {exc}")
             return False
@@ -562,6 +577,14 @@ class LinkedInHandler(BaseApplicationHandler):
             self.page.goto(job.url, timeout=30000)
             self.page.wait_for_load_state("domcontentloaded")
             self.page.wait_for_timeout(3000)
+
+            # Detect auth wall — if LinkedIn redirected us to login/checkpoint we're
+            # not authenticated and will never see the Easy Apply button.
+            url = self.page.url
+            if any(p in url for p in ("linkedin.com/login", "linkedin.com/checkpoint",
+                                       "linkedin.com/authwall", "linkedin.com/uas/login",
+                                       "linkedin.com/challenge")):
+                raise SkipApplication(f"LinkedIn auth wall — not authenticated ({url[:60]})")
 
             easy_apply = self._find_easy_apply_btn()
             if easy_apply:
@@ -1988,7 +2011,11 @@ class ApplicationAgent:
 
         # Platforms where we apply via job URL → ATS redirect rather than through
         # the platform's own login + apply flow.
-        _DIRECT_URL_PLATFORMS = {"indeed", "naukri"}
+        # LinkedIn is included because Easy Apply jobs are handled lazily by
+        # _get_linkedin_handler() inside _apply_via_job_url, and off-site jobs
+        # are resolved via the guest API. The old path (login up-front + apply)
+        # produced a redundant blocked login from the CI IP on every run.
+        _DIRECT_URL_PLATFORMS = {"indeed", "naukri", "linkedin"}
 
         ctx, page, close = self._open_session(playwright)
         try:
@@ -2095,7 +2122,10 @@ class ApplicationAgent:
         except (KeyError, FileNotFoundError):
             return None
         handler = LinkedInHandler(page)
-        handler.login(creds["username"], creds["password"])
+        ok = handler.login(creds["username"], creds["password"])
+        if not ok:
+            print("  [Agent3] LinkedIn login failed — Easy Apply disabled for this run.")
+            return None
         self._li_handler = handler
         return handler
 
