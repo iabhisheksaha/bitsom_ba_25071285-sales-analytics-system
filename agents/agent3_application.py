@@ -2118,8 +2118,23 @@ class ApplicationAgent:
             if not ext_url:
                 ext_url = self._linkedin_apply_url_via_browser(page, job.url)
             if not ext_url:
-                print(f"  [Agent3/LinkedIn] No off-site apply URL (Easy-Apply only) — skipping {job.company}.")
-                self.log.record(job, "skipped", "linkedin: easy-apply only (no off-site URL)")
+                # Easy Apply only — use LinkedInHandler directly
+                print(f"  [Agent3/LinkedIn] Easy Apply job — using LinkedInHandler for {job.company}.")
+                try:
+                    creds = self.cred_manager.get_site_credentials("linkedin", self.cred_key)
+                    li_handler = LinkedInHandler(page)
+                    li_handler.login(creds["username"], creds["password"])
+                    success = li_handler.apply(job, resume_path)
+                    status = "submitted" if success else "failed"
+                    reason = "" if success else "linkedin easy-apply: no confirmation"
+                    self.log.record(job, status, reason)
+                    print(f"  [Agent3/LinkedIn] {status.upper()} (Easy Apply) — {job.company}")
+                except (KeyError, FileNotFoundError):
+                    self.log.record(job, "skipped", "linkedin: no credentials stored for Easy Apply")
+                    print(f"  [Agent3/LinkedIn] No LinkedIn credentials — skipping {job.company}.")
+                except Exception as exc:
+                    self.log.record(job, "failed", f"linkedin easy-apply: {str(exc)[:80]}")
+                    print(f"  [Agent3/LinkedIn] Easy Apply error for {job.company}: {exc}")
                 return
             ats = detect_ats(ext_url)
             print(f"  [Agent3/LinkedIn] Off-site apply URL ({ats or 'unknown'}): {ext_url[:70]}")
