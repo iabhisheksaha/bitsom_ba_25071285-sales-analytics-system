@@ -1870,6 +1870,10 @@ class ApplicationAgent:
         self.creds_request_timeout = self.app_config.get("creds_request_timeout", 600)
         self._naukri_auth_session: Optional[requests.Session] = None
         self._naukri_session_tried: bool = False
+        # Reused across Easy-Apply jobs so we log in to LinkedIn once per session
+        # rather than re-authenticating on every job (slow + anti-bot risk).
+        self._li_handler: "Optional[LinkedInHandler]" = None
+        self._li_login_tried: bool = False
 
         tg_cfg = config.get("telegram", {})
         bot_token = os.environ.get(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"), "")
@@ -2074,6 +2078,27 @@ class ApplicationAgent:
         self.log.record(job, status, "" if success else "apply error")
         print(f"  [Agent3] {status.upper()} — {job.company}")
 
+    def _get_linkedin_handler(self, page: Page) -> "Optional[LinkedInHandler]":
+        """Return a LinkedInHandler that is logged in once per session.
+
+        Cached on the agent so repeated Easy-Apply jobs in the fallback loop
+        reuse one authenticated session instead of re-logging-in per job.
+        Returns None when no LinkedIn credentials are stored.
+        """
+        if self._li_handler is not None:
+            return self._li_handler
+        if self._li_login_tried:
+            return None  # already tried and failed — don't hammer login
+        self._li_login_tried = True
+        try:
+            creds = self.cred_manager.get_site_credentials("linkedin", self.cred_key)
+        except (KeyError, FileNotFoundError):
+            return None
+        handler = LinkedInHandler(page)
+        handler.login(creds["username"], creds["password"])
+        self._li_handler = handler
+        return handler
+
     def _apply_via_job_url(self, page: Page, job: "JobPosting", tailored_resumes: dict) -> None:
         """
         Apply to a job by following its URL to the company's external ATS.
@@ -2118,20 +2143,19 @@ class ApplicationAgent:
             if not ext_url:
                 ext_url = self._linkedin_apply_url_via_browser(page, job.url)
             if not ext_url:
-                # Easy Apply only — use LinkedInHandler directly
+                # Easy Apply only — use a LinkedInHandler logged in once per session
                 print(f"  [Agent3/LinkedIn] Easy Apply job — using LinkedInHandler for {job.company}.")
+                handler = self._get_linkedin_handler(page)
+                if handler is None:
+                    self.log.record(job, "skipped", "linkedin: no credentials stored for Easy Apply")
+                    print(f"  [Agent3/LinkedIn] No LinkedIn credentials — skipping {job.company}.")
+                    return
                 try:
-                    creds = self.cred_manager.get_site_credentials("linkedin", self.cred_key)
-                    li_handler = LinkedInHandler(page)
-                    li_handler.login(creds["username"], creds["password"])
-                    success = li_handler.apply(job, resume_path)
+                    success = handler.apply(job, resume_path)
                     status = "submitted" if success else "failed"
                     reason = "" if success else "linkedin easy-apply: no confirmation"
                     self.log.record(job, status, reason)
                     print(f"  [Agent3/LinkedIn] {status.upper()} (Easy Apply) — {job.company}")
-                except (KeyError, FileNotFoundError):
-                    self.log.record(job, "skipped", "linkedin: no credentials stored for Easy Apply")
-                    print(f"  [Agent3/LinkedIn] No LinkedIn credentials — skipping {job.company}.")
                 except Exception as exc:
                     self.log.record(job, "failed", f"linkedin easy-apply: {str(exc)[:80]}")
                     print(f"  [Agent3/LinkedIn] Easy Apply error for {job.company}: {exc}")

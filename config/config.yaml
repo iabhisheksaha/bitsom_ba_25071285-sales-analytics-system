@@ -45,6 +45,11 @@ applicant:
   phone: "+91 8956666903"
   linkedin_url: "https://www.linkedin.com/in/itsabhisheksaha/"
   location: "Pune, Maharashtra, India"
+  # Optional — used to answer ATS salary / notice fields. Leave blank to let
+  # the LLM Council decide instead of submitting a hardcoded figure.
+  current_ctc: ""
+  expected_ctc: ""
+  notice_period: "30 days"
 
 # ── LLM Council (karpathy/llm-council pattern) ─────────────────────────────
 # Multi-model deliberation for resume tailoring, form filling, and job scoring.

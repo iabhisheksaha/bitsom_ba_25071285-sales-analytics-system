@@ -45,6 +45,9 @@ def load_applicant_profile(config_path: str = "config/config.yaml") -> dict:
             "linkedin_url": raw.get("linkedin_url", ""),
             "location":     raw.get("location", ""),
             "city":         raw.get("location", "").split(",")[0].strip(),
+            "current_ctc":   raw.get("current_ctc", ""),
+            "expected_ctc":  raw.get("expected_ctc", ""),
+            "notice_period": raw.get("notice_period", "30 days"),
         }
     except Exception:
         _PROFILE_CACHE = {}
@@ -110,11 +113,14 @@ _PRESET_PATTERNS: "list[tuple[re.Pattern, object]]" = [
     (re.compile(r"\bcity|current\s*location\b",re.I),  lambda p, _: p.get("city", "")),
     (re.compile(r"\blocation\b",               re.I),  lambda p, _: p.get("location", "")),
 
-    # Work authorization / legal eligibility
+    # Work authorization / legal eligibility.
+    # NOTE: deliberately does NOT blanket-match "citizen" — a question like
+    # "Are you a U.S. citizen?" must not be auto-answered "Yes" for an
+    # India-based applicant. Only match explicit work-authorization phrasing.
     (re.compile(
         r"work.{0,20}authoriz|authoriz.{0,20}work|right.{0,12}work|"
         r"legally.{0,20}(eligible|authoriz)|eligible.{0,12}work|"
-        r"permitted.{0,12}work|citizen|permanent\s+resident",
+        r"permitted.{0,12}work|authoriz.{0,12}(to\s+)?work",
         re.I), "Yes"),
 
     # Sponsorship
@@ -136,22 +142,27 @@ _PRESET_PATTERNS: "list[tuple[re.Pattern, object]]" = [
     (re.compile(r"years?.{0,12}(business.?analys|ba\s+experience)", re.I), "12"),
     (re.compile(r"years?\s+of\s+experience|experience.{0,8}years?", re.I), "12"),
 
-    # Salary
-    (re.compile(r"current.{0,12}(ctc|salary|compensation|package)", re.I), "20 LPA"),
-    (re.compile(r"expect.{0,12}(ctc|salary|compensation)|salary.{0,12}expect", re.I), "30 LPA"),
+    # Salary — sourced from profile (config: applicant.current_ctc / expected_ctc)
+    (re.compile(r"current.{0,12}(ctc|salary|compensation|package)", re.I),
+     lambda p, _: p.get("current_ctc", "")),
+    (re.compile(r"expect.{0,12}(ctc|salary|compensation)|salary.{0,12}expect", re.I),
+     lambda p, _: p.get("expected_ctc", "")),
 
     # Notice period
-    (re.compile(r"notice.{0,12}period|serving.{0,6}notice|available.{0,8}(join|start)", re.I), "30 days"),
+    (re.compile(r"notice.{0,12}period|serving.{0,6}notice|available.{0,8}(join|start)", re.I),
+     lambda p, _: p.get("notice_period", "30 days")),
 
     # Relocation / travel
     (re.compile(r"\brelocat\b", re.I), "Yes"),
     (re.compile(r"travel.{0,12}(willing|required|percent)", re.I), "Yes, up to 25%"),
 
-    # DEI / voluntary disclosures
-    (re.compile(r"\bveteran\b|military.{0,8}service", re.I), "I am not a protected veteran"),
+    # DEI / voluntary self-identification.
+    # These are optional EEO fields; default to "decline to self-identify"
+    # rather than asserting demographics on the applicant's behalf.
+    (re.compile(r"\bveteran\b|military.{0,8}service", re.I), "I choose not to self-identify"),
     (re.compile(r"\bdisabilit\b", re.I), "I choose not to self-identify"),
-    (re.compile(r"^gender$|gender.{0,6}(identif|pronoun)", re.I), "Male"),
-    (re.compile(r"ethnicity|race|national.{0,6}origin", re.I), "Asian"),
+    (re.compile(r"^gender$|gender.{0,6}(identif|pronoun)", re.I), "Decline to self-identify"),
+    (re.compile(r"ethnicity|race|national.{0,6}origin", re.I), "Decline to self-identify"),
 ]
 
 
@@ -283,7 +294,20 @@ def _council_answer(label: str, field_type: str,
         f"Resume excerpt (first 600 chars):\n{resume_text[:600]}\n\n"
         f"What should be entered in this field?"
     )
-    return ask_council_brief(question, system=system, max_tokens=64)
+    return _sanitize_value(ask_council_brief(question, system=system, max_tokens=64))
+
+
+def _sanitize_value(raw: str) -> str:
+    """Reduce a model answer to a single clean line for a form field.
+
+    The chairman can occasionally wrap a value in prose; keep only the first
+    non-empty line and strip surrounding quotes/markdown so we never type a
+    paragraph into a single input.
+    """
+    if not raw:
+        return ""
+    first = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+    return first.strip().strip('"').strip("'").strip("`").strip()
 
 
 def _single_model_answer(label: str, field_type: str,
@@ -328,17 +352,20 @@ _RADIO_PRESET: "list[tuple[re.Pattern, str]]" = [
 
 def _select_radio(page, radios, target_value: str) -> bool:
     """Click the radio button whose label/value best matches target_value."""
-    target = target_value.lower()
+    target = target_value.lower().strip()
+    # Word-boundary match avoids "no" matching inside "Nottingham" / "do not".
+    word_re = re.compile(r"\b" + re.escape(target) + r"\b") if target else None
     for radio in radios:
         try:
-            val = (radio.get_attribute("value") or "").lower()
+            val = (radio.get_attribute("value") or "").lower().strip()
             el_id = radio.get_attribute("id") or ""
             label_text = ""
             if el_id:
                 lbl = page.query_selector(f'label[for="{el_id}"]')
                 if lbl:
-                    label_text = lbl.inner_text().lower()
-            if val == target or label_text.startswith(target) or target in label_text:
+                    label_text = lbl.inner_text().lower().strip()
+            if (val == target or label_text == target
+                    or (word_re and word_re.search(label_text))):
                 radio.click()
                 page.wait_for_timeout(400)
                 return True
@@ -386,16 +413,28 @@ def _radio_group_question(page, name: str, legend_text: str,
 # Public API
 # ---------------------------------------------------------------------------
 
+# Max LLM-council fallbacks per form-fill pass. The council is slow (up to ~9
+# sequential HTTP calls each, blocking the Playwright thread); without a cap a
+# form with many unknown fields could stall long enough to trip ATS/session
+# timeouts and bot heuristics. Presets/honeypots are unaffected by this budget.
+_MAX_COUNCIL_CALLS_PER_PASS = 4
+
+
 def fill_page_fields(page, profile: "dict | None" = None,
                      resume_text: str = "") -> int:
     """
     Fill all visible text/email/tel/number inputs on the page.
     Returns the count of fields filled.
+
+    Preset/profile answers are applied to every matching field; the slower
+    LLM-council fallback is budgeted to ``_MAX_COUNCIL_CALLS_PER_PASS`` per
+    pass to bound latency on forms with many unknown fields.
     """
     if profile is None:
         profile = load_applicant_profile()
 
     filled = 0
+    council_calls = 0
     try:
         inputs = page.query_selector_all(
             "input[type='text'], input[type='email'], input[type='tel'], "
@@ -423,9 +462,10 @@ def fill_page_fields(page, profile: "dict | None" = None,
                     continue
 
                 value = _preset_answer(label, profile, resume_text)
-                if not value and label:
+                if not value and label and council_calls < _MAX_COUNCIL_CALLS_PER_PASS:
                     field_type = inp.get_attribute("type") or "text"
                     value = _council_answer(label, field_type, profile, resume_text)
+                    council_calls += 1
 
                 if value:
                     _react_fill(page, inp, value)

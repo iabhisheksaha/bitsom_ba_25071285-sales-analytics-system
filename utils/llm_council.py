@@ -25,16 +25,38 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
-COUNCIL_MEMBERS: list[str] = [
+_DEFAULT_COUNCIL_MEMBERS: list[str] = [
     "anthropic/claude-sonnet-4-6",
     "openai/gpt-4o",
     "google/gemini-2.0-flash",
     "meta-llama/llama-3.3-70b-instruct",
 ]
 
-CHAIRMAN: str = "anthropic/claude-opus-4-8"
+_DEFAULT_CHAIRMAN: str = "anthropic/claude-opus-4-8"
 
 _HTTP_TIMEOUT = 120  # seconds per request
+
+
+def _load_council_config(config_path: str = "config/config.yaml") -> tuple[list[str], str]:
+    """Read council members/chairman from config, falling back to defaults.
+
+    Keeps config/config.yaml as the single source of truth so that editing
+    ``council.members`` / ``council.chairman`` actually changes the council
+    (previously these were ignored in favour of module constants).
+    """
+    try:
+        import yaml
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        council = cfg.get("council", {}) or {}
+        members = council.get("members") or _DEFAULT_COUNCIL_MEMBERS
+        chairman = council.get("chairman") or _DEFAULT_CHAIRMAN
+        return list(members), chairman
+    except Exception:
+        return list(_DEFAULT_COUNCIL_MEMBERS), _DEFAULT_CHAIRMAN
+
+
+COUNCIL_MEMBERS, CHAIRMAN = _load_council_config()
 
 # ---------------------------------------------------------------------------
 # Internal helpers — HTTP
@@ -190,8 +212,14 @@ _RANKING_SYSTEM = (
 )
 
 
-def _build_ranking_prompt(question: str, responses: dict[str, str], exclude: str) -> str:
-    """Build a prompt asking a model to rank all *other* models' responses."""
+def _build_ranking_prompt(
+    question: str, responses: dict[str, str], exclude: str
+) -> "tuple[str, dict[str, str]]":
+    """Build a prompt asking a model to rank all *other* models' responses.
+
+    Returns ``(prompt, label_map)`` where ``label_map`` maps the anonymous
+    labels (A, B, …) back to their originating model IDs.
+    """
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     # Exclude the ranker's own response so it remains anonymous to itself.
     peer_items = [(m, r) for m, r in responses.items() if m != exclude]
@@ -321,14 +349,29 @@ async def _stage3_synthesize(
     avg_ranks: dict[str, float],
     chairman: str,
     max_tokens: int,
+    caller_system: str = "",
 ) -> str:
-    """Chairman synthesizes a final answer."""
+    """
+    Chairman synthesizes a final answer.
+
+    The caller's original ``system`` prompt (which may carry output-format
+    constraints such as "SCORE: N" or "reply with ONLY the value") is appended
+    to the chairman's instructions so the synthesized answer still honours the
+    caller's required format — otherwise those constraints, applied only in
+    Stage 1, would be silently lost at synthesis time.
+    """
     prompt = _build_synthesis_prompt(question, answers, avg_ranks)
+    system = _SYNTHESIS_SYSTEM
+    if caller_system:
+        system = (
+            f"{_SYNTHESIS_SYSTEM}\n\n"
+            f"The final answer MUST also obey these original instructions:\n{caller_system}"
+        )
     return await _call_model(
         client,
         chairman,
         [{"role": "user", "content": prompt}],
-        system=_SYNTHESIS_SYSTEM,
+        system=system,
         max_tokens=max_tokens,
     )
 
@@ -357,6 +400,27 @@ async def _run_council(
     """
     if models is None:
         models = COUNCIL_MEMBERS
+
+    # When no OpenRouter key is present, every model is routed to the Anthropic
+    # direct API — which only serves Anthropic-family models. Non-Anthropic
+    # members (gpt-4o, gemini, llama) would 400 one by one, silently collapsing
+    # the council to whatever Claude models remain. Filter them up front and
+    # warn, so the degradation is explicit rather than a stream of failures.
+    if not _openrouter_key():
+        anthropic_models = [m for m in models if "anthropic" in m or "claude" in m]
+        if anthropic_models != models:
+            logger.warning(
+                "OPENROUTER_API_KEY not set — council limited to Anthropic models "
+                "%s (dropped %s).",
+                anthropic_models,
+                [m for m in models if m not in anthropic_models],
+            )
+        models = anthropic_models or models
+        if not _anthropic_key():
+            raise EnvironmentError(
+                "Neither OPENROUTER_API_KEY nor ANTHROPIC_API_KEY is set — "
+                "cannot run the council."
+            )
 
     async with httpx.AsyncClient() as client:
         # --- Stage 1 ---
@@ -387,7 +451,8 @@ async def _run_council(
         # --- Stage 3 ---
         logger.info("Council Stage 3: chairman (%s) synthesizing final answer", chairman)
         final_answer = await _stage3_synthesize(
-            client, question, answers, avg_ranks, chairman, max_tokens
+            client, question, answers, avg_ranks, chairman, max_tokens,
+            caller_system=system,
         )
         return final_answer
 
