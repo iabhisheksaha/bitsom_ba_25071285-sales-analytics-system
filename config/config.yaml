@@ -54,18 +54,36 @@ applicant:
 
 # ── LLM Council (karpathy/llm-council pattern) ─────────────────────────────
 # Multi-model deliberation for resume tailoring, form filling, and job scoring.
-# Set OPENROUTER_API_KEY environment variable to enable full council.
-# Falls back to single Anthropic call (ANTHROPIC_API_KEY) when OpenRouter not set.
+#
+# FREE options (no credit card required):
+#   OPTION A — OpenRouter free tier:
+#     1. Sign up at https://openrouter.ai (free, no CC)
+#     2. Create an API key (free-tier keys work with :free models)
+#     3. Add OPENROUTER_API_KEY to GitHub → Settings → Secrets and variables
+#        → Actions → New repository secret
+#
+#   OPTION B — Google AI Studio (Gemini):
+#     1. Sign up at https://aistudio.google.com (free, no CC)
+#     2. Click "Get API key" → Create API key
+#     3. Add GOOGLE_API_KEY to GitHub → Settings → Secrets and variables
+#        → Actions → New repository secret
+#
+#   OPTION C — No key:
+#     Pipeline still runs but uses heuristic 7.0/10 for all jobs (no tailoring).
+#     Set use_for entries below to false to skip council entirely.
+#
+# Priority order: OPENROUTER_API_KEY > GOOGLE_API_KEY > ANTHROPIC_API_KEY > heuristic
 council:
-  # Council members queried in parallel (Stage 1 + Stage 2)
+  # Council members queried in parallel (Stage 1 + Stage 2).
+  # All :free models work with OpenRouter free tier; gemini-* work with GOOGLE_API_KEY.
   members:
-    - "anthropic/claude-sonnet-4-6"
-    - "openai/gpt-4o"
-    - "google/gemini-2.0-flash"
-    - "meta-llama/llama-3.3-70b-instruct"
+    - "google/gemini-2.0-flash-exp:free"
+    - "meta-llama/llama-3.1-8b-instruct:free"
+    - "mistralai/mistral-7b-instruct:free"
+    - "qwen/qwen3-8b:free"
   # Chairman synthesizes final answer (Stage 3)
-  chairman: "anthropic/claude-opus-4-8"
-  # Where to apply the council (each adds API cost; disable to skip)
+  chairman: "google/gemini-2.0-flash-exp:free"
+  # Where to apply the council (disable any to skip that stage)
   use_for:
     resume_tailoring: true   # Council writes the professional summary
     form_filling: true       # Council answers unknown ATS screening questions

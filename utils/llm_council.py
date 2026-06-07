@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+# Google AI Studio OpenAI-compatible endpoint (free, no credit card required)
+GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 _DEFAULT_COUNCIL_MEMBERS: list[str] = [
     "anthropic/claude-sonnet-4-6",
@@ -65,6 +67,10 @@ COUNCIL_MEMBERS, CHAIRMAN = _load_council_config()
 
 def _openrouter_key() -> Optional[str]:
     return os.environ.get("OPENROUTER_API_KEY")
+
+
+def _google_key() -> Optional[str]:
+    return os.environ.get("GOOGLE_API_KEY")
 
 
 def _anthropic_key() -> Optional[str]:
@@ -109,6 +115,52 @@ async def _call_openrouter(
     return data["choices"][0]["message"]["content"]
 
 
+async def _call_google_direct(
+    client: httpx.AsyncClient,
+    model: str,
+    messages: list[dict],
+    system: str,
+    max_tokens: int,
+) -> str:
+    """Call Google AI Studio via its OpenAI-compatible endpoint (free, no CC required).
+
+    Sign up at https://aistudio.google.com → Get API key. Set GOOGLE_API_KEY env var.
+    Strips OpenRouter provider prefix (e.g. 'google/gemini-2.0-flash-exp:free'
+    becomes 'gemini-2.0-flash-exp').
+    """
+    api_key = _google_key()
+    if not api_key:
+        raise EnvironmentError("GOOGLE_API_KEY is not set")
+
+    # Strip provider prefix and :free suffix for Google direct calls
+    bare_model = model.split("/")[-1] if "/" in model else model
+    bare_model = bare_model.split(":")[0]  # remove :free tag
+
+    all_messages = []
+    if system:
+        all_messages.append({"role": "system", "content": system})
+    all_messages.extend(messages)
+
+    payload: dict = {
+        "model": bare_model,
+        "messages": all_messages,
+        "max_tokens": max_tokens,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    response = await client.post(
+        GOOGLE_BASE_URL,
+        json=payload,
+        headers=headers,
+        timeout=_HTTP_TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
+
 async def _call_anthropic_direct(
     client: httpx.AsyncClient,
     model: str,
@@ -116,11 +168,11 @@ async def _call_anthropic_direct(
     system: str,
     max_tokens: int,
 ) -> str:
-    """Fallback: call Anthropic API directly when OpenRouter key is absent."""
+    """Fallback: call Anthropic API directly when OpenRouter/Google keys are absent."""
     api_key = _anthropic_key()
     if not api_key:
         raise EnvironmentError(
-            "Neither OPENROUTER_API_KEY nor ANTHROPIC_API_KEY is set"
+            "No LLM API key set (OPENROUTER_API_KEY, GOOGLE_API_KEY, or ANTHROPIC_API_KEY)"
         )
 
     # Anthropic only supports claude-* models natively; strip provider prefix
@@ -158,10 +210,11 @@ async def _call_model(
     system: str = "",
     max_tokens: int = 512,
 ) -> str:
-    """Route to OpenRouter (preferred) or Anthropic direct (fallback)."""
+    """Route to first available backend: OpenRouter → Google AI Studio → Anthropic direct."""
     if _openrouter_key():
         return await _call_openrouter(client, model, messages, system, max_tokens)
-    # Fallback: only Anthropic-family models work via direct API
+    if _google_key():
+        return await _call_google_direct(client, model, messages, system, max_tokens)
     return await _call_anthropic_direct(client, model, messages, system, max_tokens)
 
 
@@ -401,25 +454,41 @@ async def _run_council(
     if models is None:
         models = COUNCIL_MEMBERS
 
-    # When no OpenRouter key is present, every model is routed to the Anthropic
-    # direct API — which only serves Anthropic-family models. Non-Anthropic
-    # members (gpt-4o, gemini, llama) would 400 one by one, silently collapsing
-    # the council to whatever Claude models remain. Filter them up front and
-    # warn, so the degradation is explicit rather than a stream of failures.
+    # Filter models to those supported by the available backend.
+    # OpenRouter can call any model; Google/Anthropic direct only support their own.
     if not _openrouter_key():
-        anthropic_models = [m for m in models if "anthropic" in m or "claude" in m]
-        if anthropic_models != models:
-            logger.warning(
-                "OPENROUTER_API_KEY not set — council limited to Anthropic models "
-                "%s (dropped %s).",
-                anthropic_models,
-                [m for m in models if m not in anthropic_models],
-            )
-        models = anthropic_models or models
-        if not _anthropic_key():
+        if _google_key():
+            # Google AI Studio supports only Gemini family
+            gemini_models = [m for m in models if "gemini" in m or "google" in m]
+            dropped = [m for m in models if m not in gemini_models]
+            if dropped:
+                logger.warning(
+                    "GOOGLE_API_KEY set (no OpenRouter) — council limited to Gemini "
+                    "models %s (dropped %s).",
+                    gemini_models,
+                    dropped,
+                )
+            models = gemini_models or models
+            # Also ensure chairman is a Gemini model
+            if "gemini" not in chairman and "google" not in chairman:
+                chairman = models[0] if models else chairman
+        elif _anthropic_key():
+            # Anthropic direct only serves Claude models
+            anthropic_models = [m for m in models if "anthropic" in m or "claude" in m]
+            dropped = [m for m in models if m not in anthropic_models]
+            if dropped:
+                logger.warning(
+                    "ANTHROPIC_API_KEY set (no OpenRouter/Google) — council limited "
+                    "to Anthropic models %s (dropped %s).",
+                    anthropic_models,
+                    dropped,
+                )
+            models = anthropic_models or models
+        else:
             raise EnvironmentError(
-                "Neither OPENROUTER_API_KEY nor ANTHROPIC_API_KEY is set — "
-                "cannot run the council."
+                "No LLM API key found. Set one of: OPENROUTER_API_KEY (free tier at "
+                "openrouter.ai), GOOGLE_API_KEY (free at aistudio.google.com), or "
+                "ANTHROPIC_API_KEY. Pipeline will use heuristic scoring without any key."
             )
 
     async with httpx.AsyncClient() as client:

@@ -51,7 +51,17 @@ if ($anthropicCred) {
 $openrouterCred = Get-StoredCredential -Target "JobApp_OPENROUTER_KEY"
 if ($openrouterCred) {
     $env:OPENROUTER_API_KEY = $openrouterCred.GetNetworkCredential().Password
-    Write-Host "      OPENROUTER_API_KEY loaded (full multi-model council enabled)."
+    Write-Host "      OPENROUTER_API_KEY loaded (LLM Council enabled via OpenRouter free tier)."
+} else {
+    Write-Host "      WARNING: JobApp_OPENROUTER_KEY not found — trying Google AI Studio key..."
+    Write-Host "               Get a free key at: https://aistudio.google.com/app/apikey"
+    Write-Host "               Then: New-StoredCredential -Target 'JobApp_OPENROUTER_KEY' -UserName key -Password '<key>' -Persist LocalMachine"
+}
+
+$googleCred = Get-StoredCredential -Target "JobApp_GOOGLE_KEY"
+if ($googleCred) {
+    $env:GOOGLE_API_KEY = $googleCred.GetNetworkCredential().Password
+    Write-Host "      GOOGLE_API_KEY loaded (LLM Council enabled via Google AI Studio)."
 }
 
 Write-Host "      Secrets loaded OK."

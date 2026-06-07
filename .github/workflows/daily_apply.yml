@@ -44,6 +44,11 @@ jobs:
           TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
           SCRAPER_API_KEY:     ${{ secrets.SCRAPER_API_KEY }}
+          # LLM Council — set ONE of these; free tiers available for both:
+          #   OPENROUTER_API_KEY: free at https://openrouter.ai (no credit card)
+          #   GOOGLE_API_KEY:     free at https://aistudio.google.com (no credit card)
+          OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
+          GOOGLE_API_KEY:      ${{ secrets.GOOGLE_API_KEY }}
         run: python orchestrator.py
 
       - name: Upload logs
